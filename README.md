@@ -1,0 +1,2 @@
+# ezitech
+onsite Ai internship 
