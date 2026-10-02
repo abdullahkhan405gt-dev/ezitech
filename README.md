@@ -1,74 +1,95 @@
-DocNow Telehealth Consultation Summariser
 
-This project is a beginner-friendly Python tool that summarizes telehealth consultation transcripts while avoiding invented medical information.
-
-What it does:
-
-Extracts patient symptoms and consultation details.
-Uses “I don't know” when information is missing or unclear.
-Does not invent diagnoses, medicines, or medical facts.
-Produces structured JSON output.
-Includes automated tests for missing and ambiguous information.
-Provides strict grounding and refusal rules.# ezitech
-onsite Ai internship 
-
-FOR EZITECH TASK_3
-
-# DocNow Telehealth – Task 2
+# DocNow Telehealth Structured Transcript Validator
 
 ## Description
 
-A Python program that converts raw telehealth transcripts into structured JSON and validates the data using Pydantic.
+This project validates telehealth consultation transcripts before
+summarization.
+
+It extracts patient metadata and doctor/patient dialogue, converts the
+information into structured JSON, and uses Pydantic to validate the data.
+
+Invalid transcripts are rejected with clear error messages.
 
 ## Features
 
-* Extracts patient metadata.
-* Extracts doctor/patient dialogue.
-* Validates dates and required fields.
-* Produces structured JSON.
-* Rejects invalid transcripts.
-* Stops summarisation when validation fails.
+- Extracts patient ID
+- Extracts patient name
+- Extracts date of birth
+- Extracts consultation date
+- Extracts doctor and patient dialogue
+- Validates dates using Pydantic
+- Detects missing required fields
+- Detects empty dialogue
+- Stops summarization when validation fails
+- Outputs validated JSON
+
+## Project Structure
+
+text
+docnow-telehealth-validator/
+│
+├── src/
+│   └── validator.py
+│
+├── README.md
+│
+└── requirements.txt
+
+## Installation
+
+Open the project folder in VS Code.
+
+Install Pydantic:
+
+
+pip install -r requirements.txt
+
+
+## Run
+
+From the project root folder:
+
+
+python src\validator.py
+ 
+
+## Test Cases
+
+The program tests four transcripts:
+
+1. Good Transcript
+
+   * Should pass validation.
+
+2. Bad Date
+
+   * Contains an invalid date.
+   * Should be rejected.
+
+3. Missing Field
+
+   * Missing consultation date.
+   * Should be rejected.
+
+4. Broken Dialogue
+
+   * Contains an empty Doctor dialogue.
+   * Should be rejected.
+
+## Expected Result
+
+text
+Good transcript: PASS
+Bad date rejection: PASS
+Missing field rejection: PASS
+Broken dialogue rejection: PASS
+
 
 ## Technologies
 
 * Python
 * Pydantic
 * JSON
-* VS Code
 
-## How to Run
 
-Install Pydantic:
-
-```bash
-pip install pydantic
-```
-
-Run the program:
-
-```bash
-python ezitech.py
-```
-
-## Tests
-
-The program tests:
-
-* Valid transcript 
-* Invalid date 
-* Missing field 
-* Broken dialogue 
-
-All validation tests pass.
-
-## Project Structure
-
-```text
-telehealth-task2/
-├── ezitech.py
-└── README.md
-```
-
-## Author
-
-Muhammad Abdullah Khan
