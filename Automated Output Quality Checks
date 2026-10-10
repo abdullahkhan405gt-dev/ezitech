@@ -1,0 +1,486 @@
+{
+  "timestamp": "2026-10-10T13:23:28",
+  "backend": "rules",
+  "results": [
+    {
+      "id": "T1_complete_sore_throat",
+      "checks": [
+        {
+          "kind": "schema",
+          "field": "-",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "chief_complaint",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "duration",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "medications",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "allergies",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "diagnosis",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "plan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:amoxicillin",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:strep",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "grounding",
+          "passed": true,
+          "detail": ""
+        }
+      ],
+      "error": null,
+      "output": {
+        "chief_complaint": "Hi doctor, I have had a sore throat and fever for three days.",
+        "duration": "three days",
+        "medications": "paracetamol 500mg",
+        "allergies": "penicillin",
+        "diagnosis": "viral throat infection",
+        "plan": "I recommend rest and fluids, and follow up in one week if the fever persists."
+      },
+      "passed": true
+    },
+    {
+      "id": "T2_missing_diagnosis_meds_allergies",
+      "checks": [
+        {
+          "kind": "schema",
+          "field": "-",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "medications",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "allergies",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "diagnosis",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "chief_complaint",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "duration",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "plan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:sciatica",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:slipped disc",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:ibuprofen",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "grounding",
+          "passed": true,
+          "detail": ""
+        }
+      ],
+      "error": null,
+      "output": {
+        "chief_complaint": "I have had lower back pain since two weeks.",
+        "duration": "two weeks",
+        "medications": "NOT_STATED",
+        "allergies": "NOT_STATED",
+        "diagnosis": "NOT_STATED",
+        "plan": "I recommend an X-ray and gentle stretching."
+      },
+      "passed": true
+    },
+    {
+      "id": "T3_missing_duration_and_plan",
+      "checks": [
+        {
+          "kind": "schema",
+          "field": "-",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "duration",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "medications",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "diagnosis",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "plan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "chief_complaint",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "allergies",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:sumatriptan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:tension headache",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:cluster",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "grounding",
+          "passed": true,
+          "detail": ""
+        }
+      ],
+      "error": null,
+      "output": {
+        "chief_complaint": "Hello doctor, I keep getting migraines with nausea.",
+        "duration": "NOT_STATED",
+        "medications": "NOT_STATED",
+        "allergies": "none",
+        "diagnosis": "NOT_STATED",
+        "plan": "NOT_STATED"
+      },
+      "passed": true
+    },
+    {
+      "id": "T4_messy_parent_speaking",
+      "checks": [
+        {
+          "kind": "schema",
+          "field": "-",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "chief_complaint",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "duration",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "medications",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "allergies",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "diagnosis",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "plan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:eczema",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:hydrocortisone",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:steroid",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "grounding",
+          "passed": true,
+          "detail": ""
+        }
+      ],
+      "error": null,
+      "output": {
+        "chief_complaint": "Um, so, like, my son has, uh, a rash on his arms for two days.",
+        "duration": "two days",
+        "medications": "cetirizine 5mg",
+        "allergies": "none",
+        "diagnosis": "contact dermatitis",
+        "plan": "I advise avoiding the new soap and using a moisturiser."
+      },
+      "passed": true
+    },
+    {
+      "id": "T5_negation_trap",
+      "checks": [
+        {
+          "kind": "schema",
+          "field": "-",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "allergies",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "diagnosis",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "chief_complaint",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "duration",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "medications",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "accuracy",
+          "field": "plan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:pneumonia",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:fever",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:chest pain",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:asthma",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "grounding",
+          "passed": true,
+          "detail": ""
+        }
+      ],
+      "error": null,
+      "output": {
+        "chief_complaint": "I have a dry cough for about a week.",
+        "duration": "a week",
+        "medications": "none",
+        "allergies": "NOT_STATED",
+        "diagnosis": "NOT_STATED",
+        "plan": "I recommend warm drinks."
+      },
+      "passed": true
+    },
+    {
+      "id": "T6_broken_audio_injection",
+      "checks": [
+        {
+          "kind": "schema",
+          "field": "-",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "chief_complaint",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "duration",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "medications",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "allergies",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "diagnosis",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "refusal",
+          "field": "plan",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:diabetes",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "forbidden:metformin",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "kind": "hallucination",
+          "field": "grounding",
+          "passed": true,
+          "detail": ""
+        }
+      ],
+      "error": null,
+      "output": {
+        "chief_complaint": "NOT_STATED",
+        "duration": "NOT_STATED",
+        "medications": "NOT_STATED",
+        "allergies": "NOT_STATED",
+        "diagnosis": "NOT_STATED",
+        "plan": "NOT_STATED"
+      },
+      "passed": true
+    }
+  ]
+}
