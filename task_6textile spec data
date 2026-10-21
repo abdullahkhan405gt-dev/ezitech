@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Generate the sample fabric-spec dataset for the Indus Weaves search tool.
+
+Run:      python generate_data.py
+Output:   data/fabric_specs.json   (a JSON list, one object per fabric)
+
+Needs only Python 3.8+. No packages to install. The output is identical every time
+you run it (no randomness), so the JSON file can be committed to git.
+
+IMPORTANT: this is SYNTHETIC sample data. The numbers look realistic but are not lab
+results and are not real Indus Weaves specifications. Do not use them for real orders.
+
+How it works
+  1. FABRICS (below) is the hand-written table of 27 fabrics: the raw facts.
+  2. build_entry() turns each row into a full entry: it adds the unique ID, the
+     composition text ("65% Polyester, 35% Cotton"), the category, the source name,
+     and one plain-English `text` snippet that the search tool will read later.
+  3. validate() checks the result (20-30 entries, unique IDs and names,
+     percentages add up to 100, nothing empty) and refuses to save bad data.
+
+To add a fabric: copy one block in FABRICS, edit it, run the script again.
+"""
+import argparse
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+DEFAULT_OUT = HERE / "data" / "fabric_specs.json"
+
+# ---- care instruction phrases (reused so wording stays consistent) ----
+WASH_COLD = "Machine wash cold (30°C max)"
+WASH_WARM = "Machine wash warm (40°C max)"
+WASH_GENTLE = "Machine wash cold, gentle cycle"
+HAND_COLD = "Hand wash cold"
+NO_BLEACH = "Do not bleach"
+TUMBLE_LOW = "Tumble dry low"
+NO_TUMBLE = "Do not tumble dry"
+LINE_DRY = "Line dry in shade"
+DRY_FLAT = "Dry flat"
+IRON_LOW = "Iron low heat"
+IRON_MED = "Iron medium heat"
+IRON_HIGH = "Iron high heat"
+NO_IRON = "Do not iron"
+NO_SOFTENER = "Do not use fabric softener"
+DRY_CLEAN = "Dry clean only"
+
+# ---- which category a single-fibre fabric belongs to (blends become "blend") ----
+CATEGORY_OF_FIBRE = {
+    "Cotton": "cotton", "Linen": "linen", "Viscose": "cellulosic", "Lyocell": "cellulosic",
+    "Polyester": "synthetic", "Nylon": "synthetic", "Wool": "wool", "Silk": "silk",
+}
+
+# =====================================================================
+# THE RAW FABRIC TABLE  (edit or add rows here)
+# breakdown = list of (fibre, percent); percentages must add up to 100.
+# =====================================================================
+FABRICS = [
+    {
+        "name": "Cotton Poplin 120",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 120, "width_cm": 147,
+        "construction": "Plain weave, combed yarn",
+        "finish": "Pre-shrunk, mercerised",
+        "care": [WASH_COLD, NO_BLEACH, TUMBLE_LOW, IRON_MED],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "",
+    },
+    {
+        "name": "Organic Cotton Sateen",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 130, "width_cm": 150,
+        "construction": "Sateen weave (4/1)",
+        "finish": "Soft finish, reactive dyed",
+        "care": [WASH_COLD, NO_BLEACH, TUMBLE_LOW, IRON_LOW],
+        "origin": "Lahore, Pakistan",
+        "certifications": ["GOTS"],
+        "notes": "Made from organically grown cotton.",
+    },
+    {
+        "name": "Poly-Cotton Drill 65/35",
+        "breakdown": [("Polyester", 65), ("Cotton", 35)],
+        "weight_gsm": 245, "width_cm": 150,
+        "construction": "2/1 twill (drill)",
+        "finish": "Easy-care resin finish",
+        "care": [WASH_WARM, NO_BLEACH, TUMBLE_LOW, IRON_MED],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": [],
+        "notes": "Common choice for workwear and uniforms.",
+    },
+    {
+        "name": "Cotton-Polyester Shirting 80/20",
+        "breakdown": [("Cotton", 80), ("Polyester", 20)],
+        "weight_gsm": 115, "width_cm": 145,
+        "construction": "Plain weave",
+        "finish": "Easy-care, wrinkle-resistant",
+        "care": [WASH_WARM, NO_BLEACH, TUMBLE_LOW, IRON_MED],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "",
+    },
+    {
+        "name": "Cotton Stretch Poplin",
+        "breakdown": [("Cotton", 97), ("Elastane", 3)],
+        "weight_gsm": 130, "width_cm": 140,
+        "construction": "Plain weave with core-spun elastane",
+        "finish": "Pre-shrunk",
+        "care": [WASH_COLD, NO_BLEACH, NO_SOFTENER, TUMBLE_LOW, IRON_LOW],
+        "origin": "Karachi, Pakistan",
+        "certifications": [],
+        "notes": "Fabric softener can damage the elastane and reduce stretch recovery.",
+    },
+    {
+        "name": "Indigo Denim 12oz",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 400, "width_cm": 152,
+        "construction": "3/1 right-hand twill",
+        "finish": "Rope-dyed indigo, sanforised",
+        "care": ["Machine wash cold inside out (30°C max)", "Wash with similar colours", NO_BLEACH,
+                 TUMBLE_LOW, IRON_MED],
+        "origin": "Lahore, Pakistan",
+        "certifications": ["Better Cotton"],
+        "notes": "Indigo may transfer to light fabrics during the first washes.",
+    },
+    {
+        "name": "Stretch Denim 10oz",
+        "breakdown": [("Cotton", 78), ("Polyester", 20), ("Elastane", 2)],
+        "weight_gsm": 340, "width_cm": 145,
+        "construction": "3/1 twill, indigo yarn-dyed",
+        "finish": "Sanforised, stretch recovery finish",
+        "care": ["Machine wash cold inside out (30°C max)", NO_BLEACH, NO_SOFTENER, LINE_DRY, IRON_LOW],
+        "origin": "Karachi, Pakistan",
+        "certifications": [],
+        "notes": "",
+    },
+    {
+        "name": "Cotton Canvas 10oz",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 340, "width_cm": 150,
+        "construction": "Heavy plain weave",
+        "finish": "Pre-washed, water-repellent finish",
+        "care": [WASH_COLD, NO_BLEACH, LINE_DRY, IRON_HIGH],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": [],
+        "notes": "Used for bags, aprons and upholstery. Water-repellent finish reduces with repeated washing.",
+    },
+    {
+        "name": "Brushed Cotton Flannel",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 160, "width_cm": 147,
+        "construction": "2/1 twill, double brushed",
+        "finish": "Brushed both sides, pre-shrunk",
+        "care": [WASH_WARM, NO_BLEACH, TUMBLE_LOW, IRON_MED],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "Expect up to 5% shrinkage on the first wash.",
+    },
+    {
+        "name": "Cotton Voile",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 65, "width_cm": 140,
+        "construction": "Fine plain weave, high yarn count",
+        "finish": "Soft, semi-sheer",
+        "care": [HAND_COLD, "Do not wring", DRY_FLAT, IRON_LOW],
+        "origin": "Multan, Pakistan",
+        "certifications": [],
+        "notes": "Lightweight and semi-sheer. Suitable for summer scarves and blouses.",
+    },
+    {
+        "name": "Cotton Double Gauze",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 110, "width_cm": 135,
+        "construction": "Two loosely woven layers joined together",
+        "finish": "Naturally crinkled, garment washed",
+        "care": [WASH_COLD, NO_BLEACH, TUMBLE_LOW, "Iron optional"],
+        "origin": "Multan, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "The crinkled texture is intentional and gets softer with washing.",
+    },
+    {
+        "name": "Cotton Terry Towelling",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 400, "width_cm": 160,
+        "construction": "Terry loop pile",
+        "finish": "Bleached white, absorbent finish",
+        "care": [WASH_WARM, NO_SOFTENER, TUMBLE_LOW],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "Fabric softener reduces absorbency.",
+    },
+    {
+        "name": "Cotton Corduroy 14-Wale",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 280, "width_cm": 142,
+        "construction": "14-wale cut pile",
+        "finish": "Garment-dyed, brushed pile",
+        "care": ["Machine wash cold inside out (30°C max)", NO_BLEACH, TUMBLE_LOW, "Iron inside out on low heat"],
+        "origin": "Lahore, Pakistan",
+        "certifications": [],
+        "notes": "",
+    },
+    {
+        "name": "Linen Plain Weave",
+        "breakdown": [("Linen", 100)],
+        "weight_gsm": 180, "width_cm": 140,
+        "construction": "Plain weave",
+        "finish": "Softened, garment washed",
+        "care": [WASH_WARM, NO_BLEACH, "Tumble dry low, remove while slightly damp", "Iron high heat while damp"],
+        "origin": "Lahore, Pakistan (imported flax yarn)",
+        "certifications": [],
+        "notes": "Creases easily. This is a natural property of linen.",
+    },
+    {
+        "name": "Cotton-Linen Blend 55/45",
+        "breakdown": [("Linen", 55), ("Cotton", 45)],
+        "weight_gsm": 170, "width_cm": 140,
+        "construction": "Plain weave",
+        "finish": "Softened",
+        "care": [WASH_COLD, NO_BLEACH, LINE_DRY, IRON_HIGH],
+        "origin": "Lahore, Pakistan (imported flax yarn)",
+        "certifications": [],
+        "notes": "Creases less than pure linen.",
+    },
+    {
+        "name": "Viscose Challis",
+        "breakdown": [("Viscose", 100)],
+        "weight_gsm": 120, "width_cm": 140,
+        "construction": "Plain weave, soft drape",
+        "finish": "Digitally printed",
+        "care": [HAND_COLD, "Do not wring", DRY_FLAT, IRON_LOW],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": [],
+        "notes": "Shrinks easily. Pre-washing before cutting is recommended.",
+    },
+    {
+        "name": "Lyocell Twill",
+        "breakdown": [("Lyocell", 100)],
+        "weight_gsm": 170, "width_cm": 145,
+        "construction": "2/1 twill",
+        "finish": "Peach-skin soft finish",
+        "care": [WASH_GENTLE, NO_BLEACH, TUMBLE_LOW, IRON_LOW],
+        "origin": "Karachi, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "",
+    },
+    {
+        "name": "Polyester Georgette",
+        "breakdown": [("Polyester", 100)],
+        "weight_gsm": 75, "width_cm": 145,
+        "construction": "Crepe-twist plain weave",
+        "finish": "Soft, slightly sheer",
+        "care": [WASH_GENTLE, NO_BLEACH, LINE_DRY, "Cool iron"],
+        "origin": "Karachi, Pakistan",
+        "certifications": [],
+        "notes": "",
+    },
+    {
+        "name": "Polyester Satin",
+        "breakdown": [("Polyester", 100)],
+        "weight_gsm": 110, "width_cm": 148,
+        "construction": "Satin weave",
+        "finish": "Glossy face",
+        "care": [WASH_GENTLE, NO_BLEACH, NO_TUMBLE, "Cool iron on reverse side"],
+        "origin": "Karachi, Pakistan",
+        "certifications": [],
+        "notes": "Use a pressing cloth. A hot iron can melt the surface.",
+    },
+    {
+        "name": "Polyester-Viscose Suiting 65/35",
+        "breakdown": [("Polyester", 65), ("Viscose", 35)],
+        "weight_gsm": 240, "width_cm": 150,
+        "construction": "2/2 twill",
+        "finish": "Crease-resistant, anti-pill",
+        "care": ["Dry clean recommended", NO_BLEACH, "Press on low heat with a cloth"],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": [],
+        "notes": "",
+    },
+    {
+        "name": "Wool-Polyester Suiting 55/45",
+        "breakdown": [("Wool", 55), ("Polyester", 45)],
+        "weight_gsm": 290, "width_cm": 150,
+        "construction": "2/2 worsted twill",
+        "finish": "Pressed, crease-resistant",
+        "care": [DRY_CLEAN, NO_BLEACH, NO_TUMBLE],
+        "origin": "Lahore, Pakistan (imported wool yarn)",
+        "certifications": [],
+        "notes": "",
+    },
+    {
+        "name": "Merino Wool Twill",
+        "breakdown": [("Wool", 100)],
+        "weight_gsm": 260, "width_cm": 150,
+        "construction": "2/1 twill",
+        "finish": "Soft hand feel, moth-resistant treatment",
+        "care": [HAND_COLD + " with wool detergent", "Do not wring", DRY_FLAT, "Iron low heat with steam"],
+        "origin": "Lahore, Pakistan (Australian merino yarn)",
+        "certifications": ["Responsible Wool Standard (RWS)"],
+        "notes": "Do not tumble dry. Heat and agitation cause felting.",
+    },
+    {
+        "name": "Silk Twill",
+        "breakdown": [("Silk", 100)],
+        "weight_gsm": 80, "width_cm": 114,
+        "construction": "2/1 twill",
+        "finish": "Washed, soft lustre",
+        "care": [DRY_CLEAN, NO_TUMBLE, "Cool iron on reverse side"],
+        "origin": "Karachi, Pakistan (imported silk yarn)",
+        "certifications": [],
+        "notes": "Avoid contact with water spots and perfume.",
+    },
+    {
+        "name": "Nylon Ripstop 40D",
+        "breakdown": [("Nylon", 100)],
+        "weight_gsm": 55, "width_cm": 150,
+        "construction": "Ripstop weave",
+        "finish": "DWR (durable water repellent)",
+        "care": [WASH_COLD, NO_BLEACH, NO_SOFTENER, LINE_DRY, NO_IRON],
+        "origin": "Karachi, Pakistan",
+        "certifications": [],
+        "notes": "Fabric softener can reduce the water-repellent finish.",
+    },
+    {
+        "name": "Recycled Polyester Fleece",
+        "breakdown": [("Polyester", 100)],
+        "weight_gsm": 280, "width_cm": 150,
+        "construction": "Knit, brushed both sides",
+        "finish": "Anti-pill",
+        "care": [WASH_COLD, NO_BLEACH, TUMBLE_LOW, NO_IRON],
+        "origin": "Karachi, Pakistan",
+        "certifications": ["Global Recycled Standard (GRS)"],
+        "notes": "Made from recycled polyester.",
+    },
+    {
+        "name": "Cotton Jersey Knit",
+        "breakdown": [("Cotton", 100)],
+        "weight_gsm": 180, "width_cm": 175,
+        "construction": "Single jersey knit",
+        "finish": "Enzyme washed, pre-shrunk",
+        "care": [WASH_COLD, NO_BLEACH, TUMBLE_LOW, IRON_LOW],
+        "origin": "Faisalabad, Pakistan",
+        "certifications": ["OEKO-TEX Standard 100"],
+        "notes": "Expect up to 5% length-wise shrinkage on the first wash.",
+    },
+    {
+        "name": "Acrylic-Wool Knit 70/30",
+        "breakdown": [("Acrylic", 70), ("Wool", 30)],
+        "weight_gsm": 230, "width_cm": 160,
+        "construction": "Rib knit",
+        "finish": "Soft, anti-pill",
+        "care": [WASH_GENTLE, NO_BLEACH, "Reshape and dry flat", NO_TUMBLE, IRON_LOW],
+        "origin": "Lahore, Pakistan",
+        "certifications": [],
+        "notes": "",
+    },
+]
+
+
+# =====================================================================
+# BUILD ONE ENTRY
+# =====================================================================
+def composition_text(breakdown):
+    """[("Polyester", 65), ("Cotton", 35)] -> '65% Polyester, 35% Cotton'"""
+    return ", ".join(f"{pct}% {fibre}" for fibre, pct in breakdown)
+
+
+def category_of(breakdown):
+    if len(breakdown) > 1:
+        return "blend"
+    return CATEGORY_OF_FIBRE[breakdown[0][0]]
+
+
+def snippet_text(e):
+    """One plain-English paragraph. The search tool will index and quote this."""
+    parts = [
+        f"{e['name']} ({e['id']}).",
+        f"Composition: {e['composition']}.",
+        f"Weight {e['weight_gsm']} gsm, width {e['width_cm']} cm.",
+        f"Construction: {e['construction']}.",
+        f"Finish: {e['finish']}.",
+        f"Care: {'; '.join(e['care'])}.",
+        f"Origin: {e['origin']}.",
+        f"Certifications: {', '.join(e['certifications']) if e['certifications'] else 'none listed'}.",
+    ]
+    if e["notes"]:
+        parts.append(f"Note: {e['notes']}")
+    return " ".join(parts)
+
+
+def build_entry(number, raw):
+    entry = {
+        "id": f"IW-FAB-{number:03d}",
+        "name": raw["name"],
+        "category": category_of(raw["breakdown"]),
+        "composition": composition_text(raw["breakdown"]),
+        "composition_breakdown": [{"fibre": f, "percent": p} for f, p in raw["breakdown"]],
+        "weight_gsm": raw["weight_gsm"],
+        "width_cm": raw["width_cm"],
+        "construction": raw["construction"],
+        "finish": raw["finish"],
+        "care": list(raw["care"]),
+        "origin": raw["origin"],
+        "certifications": list(raw["certifications"]),
+        "notes": raw["notes"],
+        "source": f"Sample spec sheet IW-FAB-{number:03d}",
+    }
+    entry["text"] = snippet_text(entry)
+    return entry
+
+
+# =====================================================================
+# CHECKS (the script refuses to save data that fails any of these)
+# =====================================================================
+REQUIRED = ["id", "name", "category", "composition", "care", "origin", "source", "text"]
+
+
+def validate(entries):
+    problems = []
+    if not 20 <= len(entries) <= 30:
+        problems.append(f"expected 20-30 entries, found {len(entries)}")
+    for field in ("id", "name"):
+        values = [e[field] for e in entries]
+        dupes = sorted({v for v in values if values.count(v) > 1})
+        if dupes:
+            problems.append(f"duplicate {field}: {dupes}")
+    for e in entries:
+        label = e.get("id", "?")
+        for field in REQUIRED:
+            if not e.get(field):
+                problems.append(f"{label}: '{field}' is empty")
+        total = sum(b["percent"] for b in e["composition_breakdown"])
+        if total != 100:
+            problems.append(f"{label}: composition adds up to {total}%, not 100%")
+        if e["name"] not in e["text"] or e["composition"] not in e["text"]:
+            problems.append(f"{label}: text snippet is missing the name or composition")
+    return problems
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+def main():
+    ap = argparse.ArgumentParser(description="Generate the Indus Weaves sample fabric-spec JSON.")
+    ap.add_argument("--out", default=str(DEFAULT_OUT), help="output file (default: data/fabric_specs.json)")
+    args = ap.parse_args()
+
+    entries = [build_entry(i, raw) for i, raw in enumerate(FABRICS, start=1)]
+
+    problems = validate(entries)
+    if problems:
+        print("NOT SAVED. Fix these problems in FABRICS first:")
+        for p in problems:
+            print("  -", p)
+        sys.exit(1)
+
+    out = pathlib.Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    print(f"Saved {len(entries)} fabric specs to {out}\n")
+    print(f"{'ID':<12}{'Name':<34}Composition")
+    for e in entries:
+        print(f"{e['id']:<12}{e['name']:<34}{e['composition']}")
+    print("\nAll checks passed. (Synthetic sample data - not real specifications.)")
+
+
+if __name__ == "__main__":
+    main()
