@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Local vector store for the Indus Weaves fabric specs (Task 2: the search backend).
+
+What it does
+  1. Loads data/fabric_specs.json (made by generate_data.py in Task 1).
+  2. Splits every fabric into 3 small chunks: overview, care, origin.
+  3. Turns each chunk into an embedding (a list of numbers that captures its meaning)
+     with a free model that runs on your own computer: all-MiniLM-L6-v2.
+     No API key, no paid service, no data leaves your machine.
+  4. Saves chunks + embeddings in a ChromaDB database on disk (folder: chroma_db/).
+  5. Answers a question by finding the chunks whose meaning is closest to it.
+
+Usage
+    python vector_store.py                       build the store, then answer a demo question
+    python vector_store.py build                 (re)build the store
+    python vector_store.py search "your question"
+    python vector_store.py search "dry clean" -n 5 --category wool
+    python vector_store.py test                  run the 17 self-checks (uses a temporary store)
+
+The first run downloads the model once (about 90 MB, needs internet). After that it
+works offline.
+"""
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+DATA_FILE = HERE / "data" / "fabric_specs.json"
+DEFAULT_DB_DIR = HERE / "chroma_db"
+
+MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")  # free, local, ~90 MB
+COLLECTION_NAME = "fabric_specs"
+DEMO_QUESTION = "What is the care instruction for cotton?"
+MAX_CHUNK_CHARS = 1000  # the model reads about 256 tokens (roughly 1000 characters)
+
+
+class SetupError(Exception):
+    """A problem the user can fix (missing data, missing model, no database yet)."""
+
+
+# =====================================================================
+# 1. LOAD AND CHUNK
+# =====================================================================
+def load_specs(path=DATA_FILE):
+    path = pathlib.Path(path)
+    if not path.exists():
+        raise SetupError(f"{path} not found. Run 'python generate_data.py' first (Task 1).")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def make_chunks(spec):
+    """Split one fabric spec into 3 self-contained chunks.
+
+    Every chunk starts with the fabric name and ID, so it still makes sense on its own and
+    can be cited as, for example, [IW-FAB-006 | care].
+    """
+    head = f"{spec['name']} ({spec['id']})"
+    care = f"{head} care instructions: {'; '.join(spec['care'])}."
+    if spec.get("notes"):
+        care += f" Notes: {spec['notes']}"
+    certs = ", ".join(spec["certifications"]) if spec["certifications"] else "none listed"
+    texts = {
+        "overview": (f"{head}. Category: {spec['category']}. Composition: {spec['composition']}. "
+                     f"Weight {spec['weight_gsm']} gsm, width {spec['width_cm']} cm. "
+                     f"Construction: {spec['construction']}. Finish: {spec['finish']}."),
+        "care": care,
+        "origin": f"{head} origin and certifications. Origin: {spec['origin']}. Certifications: {certs}.",
+    }
+    return [
+        {
+            "id": f"{spec['id']}::{section}",
+            "text": text,
+            "metadata": {
+                "fabric_id": spec["id"],
+                "fabric_name": spec["name"],
+                "category": spec["category"],
+                "section": section,
+                "source": spec["source"],
+            },
+        }
+        for section, text in texts.items()
+    ]
+
+
+def make_all_chunks(specs):
+    return [chunk for spec in specs for chunk in make_chunks(spec)]
+
+
+# =====================================================================
+# 2. THE LOCAL EMBEDDING MODEL
+# =====================================================================
+class Embedder:
+    """Wraps the sentence-transformers model. embed(list of texts) -> list of vectors."""
+
+    def __init__(self, model_name=MODEL_NAME):
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise SetupError("sentence-transformers is not installed. Run: pip install -r requirements.txt")
+        try:
+            self.model = SentenceTransformer(model_name)
+        except Exception as e:
+            raise SetupError(
+                f"Could not load the embedding model '{model_name}'.\n"
+                "The first run downloads it (about 90 MB) from huggingface.co, so it needs internet.\n"
+                f"Details: {type(e).__name__}: {str(e)[:200]}")
+        self.name = model_name
+
+    def embed(self, texts):
+        # normalised vectors, so cosine similarity is a plain dot product
+        return self.model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False).tolist()
+
+
+# =====================================================================
+# 3. BUILD AND SEARCH THE CHROMADB STORE
+# =====================================================================
+def _client(db_dir):
+    import chromadb
+    from chromadb.config import Settings
+    return chromadb.PersistentClient(path=str(db_dir), settings=Settings(anonymized_telemetry=False))
+
+
+def build_store(db_dir=DEFAULT_DB_DIR, embedder=None, specs=None):
+    """Embed every chunk and save it to disk. Safe to run again: it replaces the old store."""
+    specs = specs if specs is not None else load_specs()
+    chunks = make_all_chunks(specs)
+    embedder = embedder or Embedder()
+
+    client = _client(db_dir)
+    if COLLECTION_NAME in [c if isinstance(c, str) else c.name for c in client.list_collections()]:
+        client.delete_collection(COLLECTION_NAME)
+    collection = client.create_collection(
+        COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine", "embedding_model": embedder.name},
+    )
+    collection.add(
+        ids=[c["id"] for c in chunks],
+        documents=[c["text"] for c in chunks],
+        embeddings=embedder.embed([c["text"] for c in chunks]),
+        metadatas=[c["metadata"] for c in chunks],
+    )
+    return len(specs), len(chunks)
+
+
+def open_collection(db_dir=DEFAULT_DB_DIR):
+    db_dir = pathlib.Path(db_dir)
+    if not db_dir.exists():
+        raise SetupError(f"No vector store at {db_dir}. Run 'python vector_store.py build' first.")
+    client = _client(db_dir)
+    try:
+        return client.get_collection(COLLECTION_NAME)
+    except Exception:
+        raise SetupError(f"No collection '{COLLECTION_NAME}' in {db_dir}. Run 'python vector_store.py build' first.")
+
+
+def search(question, n=3, category=None, db_dir=DEFAULT_DB_DIR, embedder=None):
+    """Return the n chunks closest in meaning to the question (best first)."""
+    collection = open_collection(db_dir)
+    built_with = (collection.metadata or {}).get("embedding_model")
+    embedder = embedder or Embedder(built_with or MODEL_NAME)
+    if built_with and embedder.name != built_with:
+        raise SetupError(f"The store was built with '{built_with}' but you are searching with "
+                         f"'{embedder.name}'. Rebuild it: python vector_store.py build")
+
+    result = collection.query(
+        query_embeddings=embedder.embed([question]),
+        n_results=n,
+        where={"category": category} if category else None,
+    )
+    hits = []
+    for rank, (cid, text, meta, dist) in enumerate(
+            zip(result["ids"][0], result["documents"][0], result["metadatas"][0], result["distances"][0]), start=1):
+        hits.append({
+            "rank": rank,
+            "score": round(1 - dist, 3),  # cosine similarity: 1.0 = identical meaning
+            "chunk_id": cid,
+            "fabric_id": meta["fabric_id"],
+            "fabric_name": meta["fabric_name"],
+            "category": meta["category"],
+            "section": meta["section"],
+            "text": text,
+        })
+    return hits
+
+
+def print_hits(question, hits):
+    print(f'\nQuestion: "{question}"\n')
+    if not hits:
+        print("  (no results)")
+    for h in hits:
+        print(f"{h['rank']}. [{h['fabric_id']} | {h['section']}]  {h['fabric_name']}   (match {h['score']})")
+        print(f"   {h['text']}\n")
+
+
+# =====================================================================
+# 4. SELF-TEST  (python vector_store.py test)
+# =====================================================================
+def rank_of(hits, predicate):
+    """Position (1-based) of the first hit that satisfies predicate, or None."""
+    for h in hits:
+        if predicate(h):
+            return h["rank"]
+    return None
+
+
+def run_tests():
+    """Self-test. Builds a throw-away store in a temp folder and returns an exit code."""
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append(ok)
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail and not ok else ""))
+
+    def show(hits):
+        for h in hits:
+            print(f"         {h['rank']}. {h['fabric_id']} | {h['section']:<8} {h['fabric_name']} (match {h['score']})")
+
+    specs = load_specs()
+    chunks = make_all_chunks(specs)
+
+    print("\n1. Chunking (no model needed)")
+    check("each fabric gives 3 chunks", len(chunks) == 3 * len(specs), f"{len(chunks)} chunks for {len(specs)} fabrics")
+    check("chunk IDs are unique", len({c['id'] for c in chunks}) == len(chunks))
+    check("every chunk is short enough for the model", all(len(c["text"]) <= MAX_CHUNK_CHARS for c in chunks),
+          f"longest is {max(len(c['text']) for c in chunks)} characters")
+    check("every chunk starts with its fabric name and ID (self-contained, citable)",
+          all(c["text"].startswith(f"{c['metadata']['fabric_name']} ({c['metadata']['fabric_id']})") for c in chunks))
+    check("care chunks contain the care instructions",
+          all(all(step in c["text"] for step in next(s for s in specs if s["id"] == c["metadata"]["fabric_id"])["care"])
+              for c in chunks if c["metadata"]["section"] == "care"))
+
+    print("\n2. Loading the local embedding model")
+    try:
+        embedder = Embedder()
+    except SetupError as e:
+        print(f"  [SKIPPED] model tests: {e}")
+        print("\nOnly the chunking tests ran. Fix the problem above and run again.")
+        return 2
+    print(f"  model: {embedder.name} (runs locally, no API key)")
+
+    db_dir = pathlib.Path(tempfile.mkdtemp(prefix="indus_vs_test_"))
+    try:
+        print("\n3. Build and persistence")
+        n_specs, n_chunks = build_store(db_dir, embedder=embedder, specs=specs)
+        check("store built from all fabrics", (n_specs, n_chunks) == (len(specs), len(chunks)), f"{n_specs} fabrics, {n_chunks} chunks")
+        reopened = open_collection(db_dir)  # a brand-new connection reading from disk
+        check("database was saved to disk and re-opens", reopened.count() == len(chunks), f"count={reopened.count()}")
+        check("the model name is saved with the data", (reopened.metadata or {}).get("embedding_model") == embedder.name)
+        check("running build twice does not duplicate chunks",
+              build_store(db_dir, embedder=embedder, specs=specs)[1] == open_collection(db_dir).count() == len(chunks))
+
+        print("\n4. Category filter")
+        hits = search("how do I wash it", n=3, category="wool", db_dir=db_dir, embedder=embedder)
+        check("category='wool' returns only wool chunks", bool(hits) and all(h["category"] == "wool" for h in hits),
+              str([h["category"] for h in hits]))
+
+        print("\n5. Sample questions (the right chunk must be in the top results)")
+        cases = [
+            ("What is the care instruction for cotton?", 3,
+             lambda h: h["section"] == "care" and "cotton" in h["fabric_name"].lower(),
+             "a care chunk of a cotton fabric"),
+            ("Which fabric is dry clean only?", 5,
+             lambda h: h["section"] == "care" and h["fabric_id"] in {"IW-FAB-020", "IW-FAB-021", "IW-FAB-023"},
+             "the care chunk of a dry-clean fabric (IW-FAB-020, 021 or 023)"),
+            ("What is the composition of silk twill?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-023",
+             "a chunk of Silk Twill (IW-FAB-023)"),
+            ("Which fabric uses Australian merino yarn?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-022",
+             "a chunk of Merino Wool Twill (IW-FAB-022)"),
+            ("Which fabric has an organic certification?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-002",
+             "a chunk of Organic Cotton Sateen (IW-FAB-002)"),
+            ("Can I use fabric softener on stretch denim?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-007" and h["section"] == "care",
+             "the care chunk of Stretch Denim (IW-FAB-007)"),
+        ]
+        for question, k, predicate, expectation in cases:
+            hits = search(question, n=k, db_dir=db_dir, embedder=embedder)
+            r = rank_of(hits, predicate)
+            check(f'"{question}"', r is not None, f"expected {expectation} in the top {k}")
+            print(f"       found at rank {r}" if r else "       not found; top results were:")
+            show(hits)
+
+        print("\n6. Error handling")
+        empty = pathlib.Path(tempfile.mkdtemp(prefix="indus_vs_empty_"))
+        shutil.rmtree(empty)
+        try:
+            search("anything", db_dir=empty, embedder=embedder)
+            check("searching before building gives a clear error", False, "no error was raised")
+        except SetupError as e:
+            check("searching before building gives a clear error", "build" in str(e))
+    finally:
+        shutil.rmtree(db_dir, ignore_errors=True)
+
+    passed = sum(results)
+    print(f"\n{passed}/{len(results)} checks passed.")
+    return 0 if passed == len(results) else 1
+
+
+# =====================================================================
+# COMMAND LINE
+# =====================================================================
+def cmd_build(args):
+    specs = load_specs()
+    print(f"Loaded {len(specs)} fabric specs, splitting into {len(specs) * 3} chunks.")
+    print(f"Loading embedding model '{MODEL_NAME}' (local, no API key)...")
+    embedder = Embedder()
+    n_specs, n_chunks = build_store(args.db_dir, embedder=embedder, specs=specs)
+    print(f"Saved {n_chunks} chunks from {n_specs} fabrics to {args.db_dir} (collection '{COLLECTION_NAME}').")
+    return embedder
+
+
+def cmd_search(args, embedder=None):
+    hits = search(args.question, n=args.n, category=args.category, db_dir=args.db_dir, embedder=embedder)
+    print_hits(args.question, hits)
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    ap = argparse.ArgumentParser(description="Local vector store for Indus Weaves fabric specs.")
+    ap.add_argument("--db-dir", default=str(DEFAULT_DB_DIR), help="where the database is stored (default: chroma_db/)")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("build", help="(re)build the vector store from data/fabric_specs.json")
+    sub.add_parser("test", help="run the self-checks (builds a temporary store)")
+    sp = sub.add_parser("search", help="ask a question")
+    sp.add_argument("question")
+    sp.add_argument("-n", type=int, default=3, help="how many results (default 3)")
+    sp.add_argument("--category", help="only search one category, e.g. cotton, blend, wool, silk")
+    args = ap.parse_args()
+
+    try:
+        if args.cmd == "build":
+            cmd_build(args)
+        elif args.cmd == "search":
+            cmd_search(args)
+        elif args.cmd == "test":
+            sys.exit(run_tests())
+        else:  # no command: build, then answer the demo question
+            embedder = cmd_build(args)
+            args.question, args.n, args.category = DEMO_QUESTION, 3, None
+            cmd_search(args, embedder=embedder)
+    except SetupError as e:
+        sys.exit(f"\nError: {e}")
+
+
+if __name__ == "__main__":
+    main()
