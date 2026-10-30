@@ -7,8 +7,12 @@ What it does
   3. Turns each chunk into an embedding (a list of numbers that captures its meaning)
      with a free model that runs on your own computer: all-MiniLM-L6-v2.
      No API key, no paid service, no data leaves your machine.
-  4. Saves chunks + embeddings in a ChromaDB database on disk (folder: chroma_db/).
-  5. Answers a question by finding the chunks whose meaning is closest to it.
+  4. PERSISTS chunks + embeddings in a ChromaDB database on disk (folder: chroma_db/,
+     collection: fabric_specs) using chromadb.PersistentClient, so the database survives
+     restarts and later tasks can open it without rebuilding.
+  5. Proves it: re-opens the saved database with a fresh connection, prints the files it
+     wrote, and appends a text log to results/vector_store_log.txt (commit both).
+  6. Answers a question by finding the chunks whose meaning is closest to it.
 
 Usage
     python vector_store.py                       build the store, then answer a demo question
@@ -21,6 +25,7 @@ The first run downloads the model once (about 90 MB, needs internet). After that
 works offline.
 """
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -118,7 +123,12 @@ class Embedder:
 # =====================================================================
 # 3. BUILD AND SEARCH THE CHROMADB STORE
 # =====================================================================
-def _client(db_dir):
+def persistent_client(db_dir):
+    """Open (or create) the on-disk ChromaDB database at db_dir.
+
+    PersistentClient is what makes the database PERSIST: everything is written to files in
+    db_dir (chroma.sqlite3 plus index folders) and is still there after the program exits.
+    """
     import chromadb
     from chromadb.config import Settings
     return chromadb.PersistentClient(path=str(db_dir), settings=Settings(anonymized_telemetry=False))
@@ -130,7 +140,7 @@ def build_store(db_dir=DEFAULT_DB_DIR, embedder=None, specs=None):
     chunks = make_all_chunks(specs)
     embedder = embedder or Embedder()
 
-    client = _client(db_dir)
+    client = persistent_client(db_dir)
     if COLLECTION_NAME in [c if isinstance(c, str) else c.name for c in client.list_collections()]:
         client.delete_collection(COLLECTION_NAME)
     collection = client.create_collection(
@@ -146,11 +156,41 @@ def build_store(db_dir=DEFAULT_DB_DIR, embedder=None, specs=None):
     return len(specs), len(chunks)
 
 
+def verify_persisted(db_dir=DEFAULT_DB_DIR):
+    """Prove the database is on disk: open it with a BRAND-NEW connection and read it back."""
+    db_dir = pathlib.Path(db_dir)
+    collection = persistent_client(db_dir).get_collection(COLLECTION_NAME)
+    files = sorted((f.relative_to(db_dir).as_posix(), f.stat().st_size) for f in db_dir.rglob("*") if f.is_file())
+    return {
+        "count": collection.count(),
+        "model": (collection.metadata or {}).get("embedding_model"),
+        "files": files,
+        "total_bytes": sum(size for _, size in files),
+    }
+
+
+def write_build_log(db_dir, n_specs, n_chunks, proof):
+    """Append a text record of the build to results/vector_store_log.txt (next to the database folder)."""
+    log_file = pathlib.Path(db_dir).resolve().parent / "results" / "vector_store_log.txt"
+    log_file.parent.mkdir(exist_ok=True)
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    lines = [f"===== {stamp} =====",
+             f"Database folder:   {pathlib.Path(db_dir).name}/   (ChromaDB PersistentClient, collection '{COLLECTION_NAME}')",
+             f"Embedding model:   {proof['model']} (local, no API key)",
+             f"Built:             {n_specs} fabrics -> {n_chunks} chunks",
+             f"Re-opened from disk with a fresh connection: {proof['count']} chunks found",
+             f"Files on disk ({proof['total_bytes'] / 1024:.0f} KB total):"]
+    lines += [f"  {name}  ({size / 1024:.0f} KB)" for name, size in proof["files"]]
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n\n")
+    return log_file
+
+
 def open_collection(db_dir=DEFAULT_DB_DIR):
     db_dir = pathlib.Path(db_dir)
     if not db_dir.exists():
         raise SetupError(f"No vector store at {db_dir}. Run 'python vector_store.py build' first.")
-    client = _client(db_dir)
+    client = persistent_client(db_dir)
     try:
         return client.get_collection(COLLECTION_NAME)
     except Exception:
@@ -312,6 +352,19 @@ def cmd_build(args):
     embedder = Embedder()
     n_specs, n_chunks = build_store(args.db_dir, embedder=embedder, specs=specs)
     print(f"Saved {n_chunks} chunks from {n_specs} fabrics to {args.db_dir} (collection '{COLLECTION_NAME}').")
+
+    proof = verify_persisted(args.db_dir)  # fresh connection: reads the data back from disk
+    print(f"\nPersisted on disk: {args.db_dir}  ({proof['total_bytes'] / 1024:.0f} KB)")
+    for name, size in proof["files"][:8]:
+        print(f"  {name}  ({size / 1024:.0f} KB)")
+    if len(proof["files"]) > 8:
+        print(f"  ... and {len(proof['files']) - 8} more files")
+    print(f"Verified: re-opened the saved database with a new connection -> {proof['count']} chunks, "
+          f"model '{proof['model']}'.")
+    if proof["count"] != n_chunks:
+        raise SetupError(f"Saved {n_chunks} chunks but read back {proof['count']}. The database was not saved correctly.")
+    log_file = write_build_log(args.db_dir, n_specs, n_chunks, proof)
+    print(f"Build log added to {log_file.parent.name}/{log_file.name}. Commit chroma_db/ and results/ to the repository.")
     return embedder
 
 
