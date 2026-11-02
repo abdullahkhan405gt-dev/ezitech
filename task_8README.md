@@ -157,7 +157,7 @@ pip install -r requirements.txt
 ## Build the store and ask a question
 
 ```
-python vector_store.py
+python ezitech.py
 ```
 
 This one command loads the JSON, splits it into chunks, embeds them, saves them to `chroma_db/`, and then answers a demo question. **The first run downloads the model once (about 90 MB, needs internet, about a minute).** After that it works offline.
@@ -187,14 +187,14 @@ Each result shows a **citation** in brackets, `[fabric ID | section]`, the fabri
 
 ### Where the database is saved, and how to prove it
 
-The database is **persistent**: `vector_store.py` uses `chromadb.PersistentClient` (function `persistent_client`), which writes everything to files in the `chroma_db/` folder, collection name `fabric_specs`. Nothing is kept only in memory, so you can close the program, come back tomorrow, and search without rebuilding.
+The database is **persistent**: `ezitech.py` uses `chromadb.PersistentClient` (function `persistent_client`), which writes everything to files in the `chroma_db/` folder, collection name `fabric_specs`. Nothing is kept only in memory, so you can close the program, come back tomorrow, and search without rebuilding.
 
-Every build checks this itself. It opens the saved folder with a brand-new connection, reads the data back, prints the files it found, and **adds a record to `results/vector_store_log.txt`** (time, model, number of chunks, file sizes). The test (`python vector_store.py test`) also checks that a fresh connection can read the saved database.
+Every build checks this itself. It opens the saved folder with a brand-new connection, reads the data back, prints the files it found, and **adds a record to `results/vector_store_log.txt`** (time, model, number of chunks, file sizes). The test (`python ezitech.py test`) also checks that a fresh connection can read the saved database.
 
 **Before you submit, commit both folders** so the database and its proof are in the repository:
 
 ```
-python vector_store.py
+python ezitech.py
 git add chroma_db results
 git commit -m "Task 2: persisted ChromaDB vector store and build log"
 ```
@@ -204,9 +204,9 @@ git commit -m "Task 2: persisted ChromaDB vector store and build log"
 ### Ask your own questions
 
 ```
-python vector_store.py search "Which fabric is dry clean only?"
-python vector_store.py search "Can I tumble dry stretch denim?" -n 5
-python vector_store.py search "how to wash it" --category silk
+python ezitech.py search "Which fabric is dry clean only?"
+python ezitech.py search "Can I tumble dry stretch denim?" -n 5
+python ezitech.py search "how to wash it" --category silk
 ```
 
 | Option | Meaning |
@@ -219,7 +219,7 @@ python vector_store.py search "how to wash it" --category silk
 
 ```
 python generate_data.py
-python vector_store.py build
+python ezitech.py build
 ```
 
 Building again replaces the old store, so nothing is duplicated.
@@ -227,10 +227,10 @@ Building again replaces the old store, so nothing is duplicated.
 ## Run the tests
 
 ```
-python vector_store.py test
+python ezitech.py test
 ```
 
-It builds a throw-away store in a temporary folder (your real `chroma_db/` is untouched) and runs 17 checks:
+It runs two suites. Part 1 (17 checks) covers the vector store: it builds a throw-away store in a temporary folder (your real `chroma_db/` is untouched) and checks:
 
 | Group | What it checks |
 |---|---|
@@ -240,7 +240,7 @@ It builds a throw-away store in a temporary folder (your real `chroma_db/` is un
 | Search | 6 sample questions each return the correct chunk in the top results, for example "What is the care instruction for cotton?" must return a *care* chunk of a cotton fabric in the top 3 |
 | Errors | Searching before building gives a clear message |
 
-The last line should read `17/17 checks passed.` For each question the test also prints the top results so you can see what came back.
+Part 1 ends with `17/17 checks passed.` For each question the test also prints the top results so you can see what came back. Part 2 (the answer engine) is described under Task 3.
 
 ## How it works
 
@@ -283,17 +283,17 @@ Every chunk starts with the fabric name and ID, so it makes sense on its own and
 | `Could not load the embedding model` | The first run needs internet to download the model (about 90 MB). Connect and try again. Some company or school networks block `huggingface.co` |
 | `sentence-transformers is not installed` | Turn on your environment (step 2) and run `pip install -r requirements.txt` |
 | `pip install` fails or `No matching distribution` | Check `python --version` is 3.10 or newer |
-| `No vector store at ...` | Run `python vector_store.py build` first |
-| `The store was built with '...' but you are searching with '...'` | You changed `EMBEDDING_MODEL`. Rebuild with `python vector_store.py build` |
+| `No vector store at ...` | Run `python ezitech.py build` first |
+| `The store was built with '...' but you are searching with '...'` | You changed `EMBEDDING_MODEL`. Rebuild with `python ezitech.py build` |
 | `data/fabric_specs.json not found` | Run `python generate_data.py` |
 | `'python' is not recognized` (Windows) | Try `py` instead of `python`, or reinstall Python with "Add to PATH" ticked |
-| Results look odd after editing data | Rebuild: `python vector_store.py build` |
+| Results look odd after editing data | Rebuild: `python ezitech.py build` |
 
 ---
 
 # Task 3: the answer engine (answers with sources)
 
-`answer_engine.py` takes a question, searches the vector store, and returns a short answer that **names the fabric spec entry it used**.
+`ezitech.py` takes a question, searches the vector store, and returns a short answer that **names the fabric spec entry it used**.
 
 ```
 How do I wash the linen blend?
@@ -303,15 +303,27 @@ How do I wash the linen blend?
 
 ## Run it
 
-You need the Task 2 setup done first, and the database must exist (`python vector_store.py`). Nothing else to install.
+You need the Task 2 setup done first, and the database must exist (`python ezitech.py`). Nothing else to install.
+
+**The main function** (all in `ezitech.py`):
+
+```python
+from ezitech import answer_question, ask
+
+r = answer_question("How do I wash the linen blend?")
+r["answer"]    # the answer text
+r["sources"]   # ['IW-FAB-015']  <- the source ID(s) of the spec entry used
+
+print(ask("How do I wash the linen blend?"))   # answer text + 'Source: IW-FAB-015'
+```
 
 ```
-python answer_engine.py                                   # runs a few demo questions
-python answer_engine.py ask "How do I wash the linen blend?"
-python answer_engine.py ask "Where is the silk twill made?" -v     # -v shows the retrieved chunks and scores
-python answer_engine.py ask "Who is the president of France?"      # -> "I don't know..."
-python answer_engine.py test                              # 22 checks
-python answer_engine.py calibrate                         # helps pick the confidence cut-off
+python ezitech.py                                         # builds the store, then runs demo questions
+python ezitech.py ask "How do I wash the linen blend?"
+python ezitech.py ask "Where is the silk twill made?" -v     # -v shows the retrieved chunks and scores
+python ezitech.py ask "Who is the president of France?"      # -> "I don't know..."
+python ezitech.py test                                    # 17 + 22 checks
+python ezitech.py calibrate                               # helps pick the confidence cut-off
 ```
 
 ## How it works
@@ -332,7 +344,7 @@ Any OpenAI-compatible endpoint works. The easiest free option is [Ollama](https:
 
 ```
 ollama pull llama3.2
-python answer_engine.py ask "How do I wash the linen blend?" --mode llm
+python ezitech.py ask "How do I wash the linen blend?" --mode llm
 ```
 
 Other free tiers can be used with environment variables:
@@ -351,14 +363,14 @@ Safety rules in `llm` mode: if the LLM cites an ID that was not retrieved, or ci
 The default 0.30 is a reasonable guess for `all-MiniLM-L6-v2`, not a measured value. Run:
 
 ```
-python answer_engine.py calibrate
+python ezitech.py calibrate
 ```
 
-It prints the best score for questions that are in the data and questions that are not, and suggests a cut-off. If it differs from 0.30, set `MIN_SCORE` (for example `MIN_SCORE=0.35 python answer_engine.py ...`).
+It prints the best score for questions that are in the data and questions that are not, and suggests a cut-off. If it differs from 0.30, set `MIN_SCORE` (for example `MIN_SCORE=0.35 python ezitech.py ask ...`).
 
 ## Tests
 
-`python answer_engine.py test` runs 22 checks: 16 logic checks (retrieval size, source extraction, the prompt contains the chunks, "I don't know" fallbacks, citation guard, LLM errors, a fake LLM server) and 6 real searches, for example "How do I wash the linen blend?" must answer with `IW-FAB-015`. Expect `22/22 checks passed.` If the model cannot load, only the 16 logic checks run and the exit code is 2.
+`python ezitech.py test` runs both suites: 17 vector store checks, then 22 answer engine checks. The 22 are: 16 logic checks (retrieval size, source extraction, the prompt contains the chunks, "I don't know" fallbacks, citation guard, LLM errors, a fake LLM server) and 6 real searches, for example "How do I wash the linen blend?" must answer with `IW-FAB-015`. Expect `22/22 checks passed.` If the model cannot load, only the 16 logic checks run and the exit code is 2.
 
 ## Known limits
 
@@ -372,7 +384,7 @@ It prints the best score for questions that are in the data and questions that a
 
 | Problem | Fix |
 |---|---|
-| `No vector store at ...` | Run `python vector_store.py` first |
+| `No vector store at ...` | Run `python ezitech.py` first |
 | Note says `The LLM was not available` | Start Ollama (`ollama serve`) and pull the model, or use `--mode template` |
 | Good questions return "I don't know" | Lower `MIN_SCORE` (run `calibrate`) |
 | Nonsense questions return spec text | Raise `MIN_SCORE`, or use `--mode llm` |
@@ -385,9 +397,8 @@ It prints the best score for questions that are in the data and questions that a
 |---|---|
 | `generate_data.py` | Task 1: generates and checks the dataset |
 | `data/fabric_specs.json` | Task 1: the generated dataset (committed) |
-| `vector_store.py` | Task 2: load, chunk, embed, store, search, and the built-in test (`python vector_store.py test`, 17 checks). One file, all the code |
-| `requirements.txt` | Task 2: libraries to install |
-| `chroma_db/` | Task 2: the saved (persistent) vector database, created by `python vector_store.py`. Commit it |
+| `ezitech.py` | **All the code in one file** (Tasks 2 and 3): load, chunk, embed, store in ChromaDB, search, `answer_question()` / `ask()` with source IDs, and the built-in tests (`python ezitech.py test`: 17 + 22 checks) |
+| `requirements.txt` | Libraries to install |
+| `chroma_db/` | Task 2: the saved (persistent) vector database, created by `python ezitech.py`. Commit it |
 | `results/vector_store_log.txt` | Task 2: log of each build, with proof the database was saved and re-read from disk. Commit it |
-| `answer_engine.py` | Task 3: retrieve, confidence check, prompt template, answer with source IDs, and its built-in test (`python answer_engine.py test`, 22 checks). One file |
 | `README.md` | This file |
