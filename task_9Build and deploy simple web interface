@@ -1,0 +1,996 @@
+#!/usr/bin/env python3
+"""ezitech.py - Indus Weaves fabric spec search tool (Tasks 2, 3 and 4 in ONE file).
+
+    question  ->  search the local vector store  ->  answer + source IDs
+
+THE MAIN FUNCTION (Task 3):
+    answer_question(question)  -> dict {"answer": "...", "sources": ["IW-FAB-015"], ...}
+    ask(question)              -> text, e.g. "Machine wash cold ... \nSource: IW-FAB-015"
+
+    >>> print(ask("How do I wash the linen blend?"))
+    Cotton-Linen Blend 55/45 [IW-FAB-015] - care: Machine wash cold (30C max); Do not bleach; ...
+    Source: IW-FAB-015
+
+How it works
+  Task 2 (vector store)
+    1. Loads data/fabric_specs.json (made by generate_data.py, Task 1).
+    2. Splits each fabric into 3 chunks (overview, care, origin) and embeds them with the free
+       local model all-MiniLM-L6-v2 (no API key).
+    3. PERSISTS them in a ChromaDB database on disk (chroma_db/, collection "fabric_specs")
+       with chromadb.PersistentClient, re-opens it to prove it, and writes results/vector_store_log.txt.
+  Task 3 (answers with sources)
+    4. RETRIEVE the top 3 chunks for the question.
+    5. If nothing is found, or the best match is too weak -> "I don't know".
+    6. PROMPT TEMPLATE puts the chunks and question together; a free LLM (mode "llm") or a
+       template (mode "template", default, no LLM needed) writes the answer.
+    7. SOURCE IDs come from the retrieved chunks' metadata (never from the LLM). An LLM answer
+       that cites an ID we did not retrieve, or none, is rejected and replaced by the template answer.
+  Task 4 (web page)
+    8. web_app() is a Streamlit page: a text box, and the answer with its sources below it. It loads
+       the vector store (building it on first start if missing) and calls answer_question() from Task 3.
+       app.py is a 3-line launcher for it.
+
+Usage
+    python ezitech.py                       build the store, then answer demo questions
+    python ezitech.py build                 (re)build the vector store
+    python ezitech.py ask "How do I wash the linen blend?" [--mode llm] [-v]
+    python ezitech.py search "dry clean" -n 5 --category wool     (raw chunks, Task 2)
+    python ezitech.py test                  all built-in checks (17 store + 22 answer engine)
+    python ezitech.py calibrate             help choose the "too weak" cut-off
+    python ezitech.py web                   start the web page (same as: streamlit run app.py)
+
+The first run downloads the model once (about 90 MB, needs internet); after that it works offline.
+"""
+import argparse
+import datetime
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = pathlib.Path(__file__).resolve().parent
+DATA_FILE = HERE / "data" / "fabric_specs.json"
+DEFAULT_DB_DIR = HERE / "chroma_db"
+
+MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")  # free, local, ~90 MB
+COLLECTION_NAME = "fabric_specs"
+DEMO_QUESTION = "What is the care instruction for cotton?"
+MAX_CHUNK_CHARS = 1000  # the model reads about 256 tokens (roughly 1000 characters)
+
+
+class SetupError(Exception):
+    """A problem the user can fix (missing data, missing model, no database yet)."""
+
+
+# =====================================================================
+# 1. LOAD AND CHUNK
+# =====================================================================
+def load_specs(path=DATA_FILE):
+    path = pathlib.Path(path)
+    if not path.exists():
+        raise SetupError(f"{path} not found. Run 'python generate_data.py' first (Task 1).")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def make_chunks(spec):
+    """Split one fabric spec into 3 self-contained chunks.
+
+    Every chunk starts with the fabric name and ID, so it still makes sense on its own and
+    can be cited as, for example, [IW-FAB-006 | care].
+    """
+    head = f"{spec['name']} ({spec['id']})"
+    care = f"{head} care instructions: {'; '.join(spec['care'])}."
+    if spec.get("notes"):
+        care += f" Notes: {spec['notes']}"
+    certs = ", ".join(spec["certifications"]) if spec["certifications"] else "none listed"
+    texts = {
+        "overview": (f"{head}. Category: {spec['category']}. Composition: {spec['composition']}. "
+                     f"Weight {spec['weight_gsm']} gsm, width {spec['width_cm']} cm. "
+                     f"Construction: {spec['construction']}. Finish: {spec['finish']}."),
+        "care": care,
+        "origin": f"{head} origin and certifications. Origin: {spec['origin']}. Certifications: {certs}.",
+    }
+    return [
+        {
+            "id": f"{spec['id']}::{section}",
+            "text": text,
+            "metadata": {
+                "fabric_id": spec["id"],
+                "fabric_name": spec["name"],
+                "category": spec["category"],
+                "section": section,
+                "source": spec["source"],
+            },
+        }
+        for section, text in texts.items()
+    ]
+
+
+def make_all_chunks(specs):
+    return [chunk for spec in specs for chunk in make_chunks(spec)]
+
+
+# =====================================================================
+# 2. THE LOCAL EMBEDDING MODEL
+# =====================================================================
+class Embedder:
+    """Wraps the sentence-transformers model. embed(list of texts) -> list of vectors."""
+
+    def __init__(self, model_name=MODEL_NAME):
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise SetupError("sentence-transformers is not installed. Run: pip install -r requirements.txt")
+        try:
+            self.model = SentenceTransformer(model_name)
+        except Exception as e:
+            raise SetupError(
+                f"Could not load the embedding model '{model_name}'.\n"
+                "The first run downloads it (about 90 MB) from huggingface.co, so it needs internet.\n"
+                f"Details: {type(e).__name__}: {str(e)[:200]}")
+        self.name = model_name
+
+    def embed(self, texts):
+        # normalised vectors, so cosine similarity is a plain dot product
+        return self.model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False).tolist()
+
+
+# =====================================================================
+# 3. BUILD AND SEARCH THE CHROMADB STORE
+# =====================================================================
+def persistent_client(db_dir):
+    """Open (or create) the on-disk ChromaDB database at db_dir.
+
+    PersistentClient is what makes the database PERSIST: everything is written to files in
+    db_dir (chroma.sqlite3 plus index folders) and is still there after the program exits.
+    """
+    import chromadb
+    from chromadb.config import Settings
+    return chromadb.PersistentClient(path=str(db_dir), settings=Settings(anonymized_telemetry=False))
+
+
+def build_store(db_dir=DEFAULT_DB_DIR, embedder=None, specs=None):
+    """Embed every chunk and save it to disk. Safe to run again: it replaces the old store."""
+    specs = specs if specs is not None else load_specs()
+    chunks = make_all_chunks(specs)
+    embedder = embedder or Embedder()
+
+    client = persistent_client(db_dir)
+    if COLLECTION_NAME in [c if isinstance(c, str) else c.name for c in client.list_collections()]:
+        client.delete_collection(COLLECTION_NAME)
+    collection = client.create_collection(
+        COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine", "embedding_model": embedder.name},
+    )
+    collection.add(
+        ids=[c["id"] for c in chunks],
+        documents=[c["text"] for c in chunks],
+        embeddings=embedder.embed([c["text"] for c in chunks]),
+        metadatas=[c["metadata"] for c in chunks],
+    )
+    return len(specs), len(chunks)
+
+
+def verify_persisted(db_dir=DEFAULT_DB_DIR):
+    """Prove the database is on disk: open it with a BRAND-NEW connection and read it back."""
+    db_dir = pathlib.Path(db_dir)
+    collection = persistent_client(db_dir).get_collection(COLLECTION_NAME)
+    files = sorted((f.relative_to(db_dir).as_posix(), f.stat().st_size) for f in db_dir.rglob("*") if f.is_file())
+    return {
+        "count": collection.count(),
+        "model": (collection.metadata or {}).get("embedding_model"),
+        "files": files,
+        "total_bytes": sum(size for _, size in files),
+    }
+
+
+def write_build_log(db_dir, n_specs, n_chunks, proof):
+    """Append a text record of the build to results/vector_store_log.txt (next to the database folder)."""
+    log_file = pathlib.Path(db_dir).resolve().parent / "results" / "vector_store_log.txt"
+    log_file.parent.mkdir(exist_ok=True)
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    lines = [f"===== {stamp} =====",
+             f"Database folder:   {pathlib.Path(db_dir).name}/   (ChromaDB PersistentClient, collection '{COLLECTION_NAME}')",
+             f"Embedding model:   {proof['model']} (local, no API key)",
+             f"Built:             {n_specs} fabrics -> {n_chunks} chunks",
+             f"Re-opened from disk with a fresh connection: {proof['count']} chunks found",
+             f"Files on disk ({proof['total_bytes'] / 1024:.0f} KB total):"]
+    lines += [f"  {name}  ({size / 1024:.0f} KB)" for name, size in proof["files"]]
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n\n")
+    return log_file
+
+
+def open_collection(db_dir=DEFAULT_DB_DIR):
+    db_dir = pathlib.Path(db_dir)
+    if not db_dir.exists():
+        raise SetupError(f"No vector store at {db_dir}. Run 'python ezitech.py build' first.")
+    client = persistent_client(db_dir)
+    try:
+        return client.get_collection(COLLECTION_NAME)
+    except Exception:
+        raise SetupError(f"No collection '{COLLECTION_NAME}' in {db_dir}. Run 'python ezitech.py build' first.")
+
+
+def search(question, n=3, category=None, db_dir=DEFAULT_DB_DIR, embedder=None):
+    """Return the n chunks closest in meaning to the question (best first)."""
+    collection = open_collection(db_dir)
+    built_with = (collection.metadata or {}).get("embedding_model")
+    embedder = embedder or Embedder(built_with or MODEL_NAME)
+    if built_with and embedder.name != built_with:
+        raise SetupError(f"The store was built with '{built_with}' but you are searching with "
+                         f"'{embedder.name}'. Rebuild it: python ezitech.py build")
+
+    result = collection.query(
+        query_embeddings=embedder.embed([question]),
+        n_results=n,
+        where={"category": category} if category else None,
+    )
+    hits = []
+    for rank, (cid, text, meta, dist) in enumerate(
+            zip(result["ids"][0], result["documents"][0], result["metadatas"][0], result["distances"][0]), start=1):
+        hits.append({
+            "rank": rank,
+            "score": round(1 - dist, 3),  # cosine similarity: 1.0 = identical meaning
+            "chunk_id": cid,
+            "fabric_id": meta["fabric_id"],
+            "fabric_name": meta["fabric_name"],
+            "category": meta["category"],
+            "section": meta["section"],
+            "text": text,
+        })
+    return hits
+
+
+def print_hits(question, hits):
+    print(f'\nQuestion: "{question}"\n')
+    if not hits:
+        print("  (no results)")
+    for h in hits:
+        print(f"{h['rank']}. [{h['fabric_id']} | {h['section']}]  {h['fabric_name']}   (match {h['score']})")
+        print(f"   {h['text']}\n")
+
+
+# =====================================================================
+# 4. SELF-TEST  (python ezitech.py test)
+# =====================================================================
+def rank_of(hits, predicate):
+    """Position (1-based) of the first hit that satisfies predicate, or None."""
+    for h in hits:
+        if predicate(h):
+            return h["rank"]
+    return None
+
+
+def run_store_tests():
+    """Self-test. Builds a throw-away store in a temp folder and returns an exit code."""
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append(ok)
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail and not ok else ""))
+
+    def show(hits):
+        for h in hits:
+            print(f"         {h['rank']}. {h['fabric_id']} | {h['section']:<8} {h['fabric_name']} (match {h['score']})")
+
+    specs = load_specs()
+    chunks = make_all_chunks(specs)
+
+    print("\n1. Chunking (no model needed)")
+    check("each fabric gives 3 chunks", len(chunks) == 3 * len(specs), f"{len(chunks)} chunks for {len(specs)} fabrics")
+    check("chunk IDs are unique", len({c['id'] for c in chunks}) == len(chunks))
+    check("every chunk is short enough for the model", all(len(c["text"]) <= MAX_CHUNK_CHARS for c in chunks),
+          f"longest is {max(len(c['text']) for c in chunks)} characters")
+    check("every chunk starts with its fabric name and ID (self-contained, citable)",
+          all(c["text"].startswith(f"{c['metadata']['fabric_name']} ({c['metadata']['fabric_id']})") for c in chunks))
+    check("care chunks contain the care instructions",
+          all(all(step in c["text"] for step in next(s for s in specs if s["id"] == c["metadata"]["fabric_id"])["care"])
+              for c in chunks if c["metadata"]["section"] == "care"))
+
+    print("\n2. Loading the local embedding model")
+    try:
+        embedder = Embedder()
+    except SetupError as e:
+        print(f"  [SKIPPED] model tests: {e}")
+        print("\nOnly the chunking tests ran. Fix the problem above and run again.")
+        return 2
+    print(f"  model: {embedder.name} (runs locally, no API key)")
+
+    db_dir = pathlib.Path(tempfile.mkdtemp(prefix="indus_vs_test_"))
+    try:
+        print("\n3. Build and persistence")
+        n_specs, n_chunks = build_store(db_dir, embedder=embedder, specs=specs)
+        check("store built from all fabrics", (n_specs, n_chunks) == (len(specs), len(chunks)), f"{n_specs} fabrics, {n_chunks} chunks")
+        reopened = open_collection(db_dir)  # a brand-new connection reading from disk
+        check("database was saved to disk and re-opens", reopened.count() == len(chunks), f"count={reopened.count()}")
+        check("the model name is saved with the data", (reopened.metadata or {}).get("embedding_model") == embedder.name)
+        check("running build twice does not duplicate chunks",
+              build_store(db_dir, embedder=embedder, specs=specs)[1] == open_collection(db_dir).count() == len(chunks))
+
+        print("\n4. Category filter")
+        hits = search("how do I wash it", n=3, category="wool", db_dir=db_dir, embedder=embedder)
+        check("category='wool' returns only wool chunks", bool(hits) and all(h["category"] == "wool" for h in hits),
+              str([h["category"] for h in hits]))
+
+        print("\n5. Sample questions (the right chunk must be in the top results)")
+        cases = [
+            ("What is the care instruction for cotton?", 3,
+             lambda h: h["section"] == "care" and "cotton" in h["fabric_name"].lower(),
+             "a care chunk of a cotton fabric"),
+            ("Which fabric is dry clean only?", 5,
+             lambda h: h["section"] == "care" and h["fabric_id"] in {"IW-FAB-020", "IW-FAB-021", "IW-FAB-023"},
+             "the care chunk of a dry-clean fabric (IW-FAB-020, 021 or 023)"),
+            ("What is the composition of silk twill?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-023",
+             "a chunk of Silk Twill (IW-FAB-023)"),
+            ("Which fabric uses Australian merino yarn?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-022",
+             "a chunk of Merino Wool Twill (IW-FAB-022)"),
+            ("Which fabric has an organic certification?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-002",
+             "a chunk of Organic Cotton Sateen (IW-FAB-002)"),
+            ("Can I use fabric softener on stretch denim?", 3,
+             lambda h: h["fabric_id"] == "IW-FAB-007" and h["section"] == "care",
+             "the care chunk of Stretch Denim (IW-FAB-007)"),
+        ]
+        for question, k, predicate, expectation in cases:
+            hits = search(question, n=k, db_dir=db_dir, embedder=embedder)
+            r = rank_of(hits, predicate)
+            check(f'"{question}"', r is not None, f"expected {expectation} in the top {k}")
+            print(f"       found at rank {r}" if r else "       not found; top results were:")
+            show(hits)
+
+        print("\n6. Error handling")
+        empty = pathlib.Path(tempfile.mkdtemp(prefix="indus_vs_empty_"))
+        shutil.rmtree(empty)
+        try:
+            search("anything", db_dir=empty, embedder=embedder)
+            check("searching before building gives a clear error", False, "no error was raised")
+        except SetupError as e:
+            check("searching before building gives a clear error", "build" in str(e))
+    finally:
+        shutil.rmtree(db_dir, ignore_errors=True)
+
+    passed = sum(results)
+    print(f"\n{passed}/{len(results)} checks passed.")
+    return 0 if passed == len(results) else 1
+
+
+# =====================================================================
+# TASK 2 COMMANDS
+# =====================================================================
+def cmd_build(args):
+    specs = load_specs()
+    print(f"Loaded {len(specs)} fabric specs, splitting into {len(specs) * 3} chunks.")
+    print(f"Loading embedding model '{MODEL_NAME}' (local, no API key)...")
+    embedder = Embedder()
+    n_specs, n_chunks = build_store(args.db_dir, embedder=embedder, specs=specs)
+    print(f"Saved {n_chunks} chunks from {n_specs} fabrics to {args.db_dir} (collection '{COLLECTION_NAME}').")
+
+    proof = verify_persisted(args.db_dir)  # fresh connection: reads the data back from disk
+    print(f"\nPersisted on disk: {args.db_dir}  ({proof['total_bytes'] / 1024:.0f} KB)")
+    for name, size in proof["files"][:8]:
+        print(f"  {name}  ({size / 1024:.0f} KB)")
+    if len(proof["files"]) > 8:
+        print(f"  ... and {len(proof['files']) - 8} more files")
+    print(f"Verified: re-opened the saved database with a new connection -> {proof['count']} chunks, "
+          f"model '{proof['model']}'.")
+    if proof["count"] != n_chunks:
+        raise SetupError(f"Saved {n_chunks} chunks but read back {proof['count']}. The database was not saved correctly.")
+    log_file = write_build_log(args.db_dir, n_specs, n_chunks, proof)
+    print(f"Build log added to {log_file.parent.name}/{log_file.name}. Commit chroma_db/ and results/ to the repository.")
+    return embedder
+
+
+def cmd_search(args, embedder=None):
+    hits = search(args.question, n=args.n, category=args.category, db_dir=args.db_dir, embedder=embedder)
+    print_hits(args.question, hits)
+
+
+# =====================================================================
+# TASK 3: ANSWER ENGINE
+# =====================================================================
+TOP_K = 3             # how many chunks the answer is based on
+CANDIDATES = 6        # how many chunks to fetch before picking the best TOP_K
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.30"))  # best match weaker than this -> "I don't know"
+BAND = 0.85           # extra chunks must score at least this share of the best one
+PREFER_RATIO = 0.80   # a chunk of the "right kind" can jump the queue if it scores this close to the best
+
+DONT_KNOW = "I don't know. I couldn't find this in the Indus Weaves fabric specs."
+ID_PATTERN = re.compile(r"\bIW-FAB-\d{3}\b")  # the ID format made by generate_data.py (Task 1)
+
+# Free LLM settings (any OpenAI-compatible chat endpoint; the default is a local Ollama server)
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+
+PROMPT_TEMPLATE = """You are a careful assistant for Indus Weaves staff. Answer the QUESTION using ONLY the SPEC EXCERPTS below.
+
+Rules:
+- If the excerpts do not contain the answer, reply exactly: I don't know.
+- After each fact, cite the source ID in square brackets, for example [IW-FAB-006].
+- Only use IDs that appear in the excerpts. Do not use outside knowledge. Be brief.
+
+SPEC EXCERPTS:
+{excerpts}
+
+QUESTION: {question}
+ANSWER:"""
+
+SECTION_LABEL = {"overview": "specification", "care": "care", "origin": "origin and certifications"}
+SECTION_PREFIX = {"care": "care instructions: ", "origin": "origin and certifications. "}
+
+# words in a question that hint which kind of chunk will hold the answer
+INTENT_PATTERNS = {
+    "care": re.compile(r"\b(wash\w*|care|dry|tumble\w*|iron\w*|bleach\w*|shrink\w*|softener|clean\w*|laundr\w*|"
+                       r"press\w*|steam\w*|maintain\w*)\b", re.I),
+    "origin": re.compile(r"\b(origin|where|countr\w*|cit(?:y|ies)|mill|certif\w*|organic|gots|oeko\w*|rws|grs|"
+                         r"imported|woven in)\b", re.I),
+    "overview": re.compile(r"\b(composition|fib(?:re|er)s?|made of|made from|percent\w*|weigh\w*|gsm|width|wide|"
+                           r"construction|finish\w*|categor\w*|content|contain\w*)\b|%", re.I),
+}
+
+
+class EngineError(Exception):
+    """The LLM could not be reached or gave an unusable reply."""
+
+
+# =====================================================================
+# 1. RETRIEVE
+# =====================================================================
+def retrieve(question, k=TOP_K, db_dir=DEFAULT_DB_DIR, embedder=None):
+    """Return the k chunks closest in meaning to the question (best first)."""
+    return search(question, n=k, db_dir=db_dir, embedder=embedder)
+
+
+def question_intent(question):
+    """Which section is the question about: 'care', 'origin', 'overview', or None if unclear."""
+    counts = {section: len(p.findall(question)) for section, p in INTENT_PATTERNS.items()}
+    best = max(counts.values())
+    winners = [s for s, c in counts.items() if c == best]
+    return winners[0] if best > 0 and len(winners) == 1 else None
+
+
+def rerank(hits, intent):
+    """Let chunks of the 'right kind' go first, but only if they are nearly as close as the best match."""
+    if not hits or not intent:
+        return list(hits)
+    best = max(h["score"] for h in hits)
+    promoted = [h for h in hits if h["section"] == intent and h["score"] >= PREFER_RATIO * best]
+    rest = [h for h in hits if h not in promoted]
+    return promoted + rest
+
+
+# =====================================================================
+# 2. SOURCE IDS
+# =====================================================================
+def extract_source_ids(hits):
+    """Fabric IDs of the retrieved chunks, in order, without repeats."""
+    ids = []
+    for h in hits:
+        if h["fabric_id"] not in ids:
+            ids.append(h["fabric_id"])
+    return ids
+
+
+def find_cited_ids(text):
+    """Every fabric ID mentioned in a piece of text, in order, without repeats."""
+    ids = []
+    for found in ID_PATTERN.findall(text):
+        if found not in ids:
+            ids.append(found)
+    return ids
+
+
+# =====================================================================
+# 3. THE PROMPT
+# =====================================================================
+def build_prompt(question, hits):
+    excerpts = "\n".join(f"[{h['fabric_id']} | {h['section']}] {h['text']}" for h in hits)
+    return PROMPT_TEMPLATE.format(excerpts=excerpts, question=question)
+
+
+# =====================================================================
+# 4. ANSWER WRITERS
+# =====================================================================
+def chunk_body(hit):
+    """The useful part of a chunk text, without the repeated 'name (ID)' start."""
+    head = f"{hit['fabric_name']} ({hit['fabric_id']})"
+    body = hit["text"][len(head):].lstrip(". ") if hit["text"].startswith(head) else hit["text"]
+    prefix = SECTION_PREFIX.get(hit["section"], "")
+    return body[len(prefix):] if prefix and body.startswith(prefix) else body
+
+
+def template_answer(hits):
+    """The 'simulated LLM': build the answer straight from the retrieved chunks."""
+    lines = []
+    for i, h in enumerate(hits):
+        line = f"{h['fabric_name']} [{h['fabric_id']}] - {SECTION_LABEL.get(h['section'], h['section'])}: {chunk_body(h)}"
+        lines.append(line if i == 0 else f"Also relevant: {line}")
+    return "\n".join(lines)
+
+
+def is_dont_know(text):
+    return re.match(r"\s*i (don't|do not|dont) know\b", text.strip(), re.I) is not None
+
+
+def call_llm(prompt, base_url=None, model=None, api_key=None, timeout=90):
+    """Ask any OpenAI-compatible chat endpoint (Ollama, or a free-tier provider) for an answer."""
+    base_url = (base_url or LLM_BASE_URL).rstrip("/")
+    api_key = LLM_API_KEY if api_key is None else api_key
+    payload = {"model": model or LLM_MODEL, "temperature": 0, "max_tokens": 300,
+               "messages": [{"role": "user", "content": prompt}]}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(base_url + "/chat/completions", data=json.dumps(payload).encode("utf-8"),
+                                     headers=headers, method="POST")
+    host = urllib.parse.urlparse(base_url).hostname
+    opener = (urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never route local servers via a proxy
+              if host in ("localhost", "127.0.0.1") else urllib.request.build_opener())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        raise EngineError(f"the LLM server at {base_url} replied with an error (HTTP {e.code})")
+    except (urllib.error.URLError, OSError) as e:
+        raise EngineError(f"could not reach the LLM server at {base_url} ({getattr(e, 'reason', e)})")
+    except (KeyError, IndexError, ValueError):
+        raise EngineError(f"the LLM server at {base_url} sent a reply in an unexpected format")
+
+
+# =====================================================================
+# 5. THE MAIN FUNCTION
+# =====================================================================
+def _result(question, answer, sources, confident, mode, top_score, chunks, note=""):
+    return {"question": question, "answer": answer, "sources": sources, "confident": confident,
+            "mode": mode, "top_score": top_score, "chunks": chunks, "note": note}
+
+
+def answer_question(question, mode="template", min_score=None, db_dir=DEFAULT_DB_DIR,
+                    embedder=None, retriever=None, llm=None):
+    """Answer one question. Returns a dict: answer, sources (fabric IDs), confident, mode, ...
+
+    retriever(question, k) and llm(prompt) can be replaced (the tests do this).
+    """
+    min_score = MIN_SCORE if min_score is None else min_score
+    retriever = retriever or (lambda q, k: retrieve(q, k, db_dir=db_dir, embedder=embedder))
+
+    # 1. retrieve, then 2. check we found something good enough
+    candidates = retriever(question, CANDIDATES) if question.strip() else []
+    ordered = rerank(candidates, question_intent(question))
+    if not ordered or ordered[0]["score"] < min_score:
+        top = ordered[0]["score"] if ordered else 0.0
+        return _result(question, DONT_KNOW, [], False, "none", top, [])
+
+    best = ordered[0]["score"]
+    used = [h for h in ordered if h["score"] >= min_score and h["score"] >= BAND * best]
+    intent = question_intent(question)
+    if intent and used[0]["section"] == intent:  # a care question should not list origin or specification chunks
+        used = [h for h in used if h["section"] == intent]
+    used = used[:TOP_K]
+    sources = extract_source_ids(used)
+
+    # 3-4. write the answer
+    if mode == "llm":
+        try:
+            raw = (llm or call_llm)(build_prompt(question, used))
+        except EngineError as e:
+            return _result(question, template_answer(used), sources, True, "template", best, used,
+                           note=f"The LLM was not available ({e}). Showing the matching spec text instead.")
+        if is_dont_know(raw):
+            return _result(question, DONT_KNOW, [], False, "llm", best, used)
+        cited = find_cited_ids(raw)
+        if not cited or any(c not in sources for c in cited):
+            return _result(question, template_answer(used), sources, True, "template", best, used,
+                           note="The LLM answer was rejected because it cited a source we did not retrieve, "
+                                "or cited none. Showing the matching spec text instead.")
+        return _result(question, raw, cited, True, "llm", best, used)
+
+    return _result(question, template_answer(used), sources, True, "template", best, used)
+
+
+def format_answer(result):
+    """Plain text for people: the answer, then the source line."""
+    if not result["sources"]:
+        return result["answer"]
+    label = "Source" if len(result["sources"]) == 1 else "Sources"
+    text = f"{result['answer']}\n{label}: {', '.join(result['sources'])}"
+    return f"{text}\n(Note: {result['note']})" if result["note"] else text
+
+
+def ask(question, **kwargs):
+    """Question in, text out: the answer followed by its source line, e.g. 'Source: IW-FAB-015'."""
+    return format_answer(answer_question(question, **kwargs))
+
+
+# =====================================================================
+# 6. SELF-TEST  (python ezitech.py test)
+# =====================================================================
+def _hit(fabric_id, name, section, text, score):
+    return {"rank": 1, "score": score, "chunk_id": f"{fabric_id}::{section}", "fabric_id": fabric_id,
+            "fabric_name": name, "category": "x", "section": section, "text": text}
+
+
+LINEN_CARE = _hit("IW-FAB-015", "Cotton-Linen Blend 55/45", "care",
+                  "Cotton-Linen Blend 55/45 (IW-FAB-015) care instructions: Machine wash cold (30°C max); "
+                  "Do not bleach; Line dry in shade; Iron high heat. Notes: Creases less than pure linen.", 0.62)
+LINEN_PLAIN_CARE = _hit("IW-FAB-014", "Linen Plain Weave", "care",
+                        "Linen Plain Weave (IW-FAB-014) care instructions: Machine wash warm (40°C max); Do not bleach.", 0.40)
+LINEN_OVERVIEW = _hit("IW-FAB-015", "Cotton-Linen Blend 55/45", "overview",
+                      "Cotton-Linen Blend 55/45 (IW-FAB-015). Category: blend. Composition: 55% Linen, 45% Cotton. "
+                      "Weight 170 gsm, width 140 cm. Construction: Plain weave. Finish: Softened.", 0.58)
+SILK_ORIGIN = _hit("IW-FAB-023", "Silk Twill", "origin",
+                   "Silk Twill (IW-FAB-023) origin and certifications. Origin: Karachi, Pakistan (imported silk yarn). "
+                   "Certifications: none listed.", 0.55)
+SILK_OVERVIEW = _hit("IW-FAB-023", "Silk Twill", "overview",
+                     "Silk Twill (IW-FAB-023). Category: silk. Composition: 100% Silk. Weight 80 gsm, width 114 cm. "
+                     "Construction: 2/1 twill. Finish: Washed, soft lustre.", 0.50)
+WEAK_OVERVIEW = _hit("IW-FAB-001", "Cotton Poplin 120", "overview",
+                     "Cotton Poplin 120 (IW-FAB-001). Category: cotton. Composition: 100% Cotton.", 0.32)
+
+
+def run_answer_tests():
+    """Self-test. Returns an exit code (0 = all passed, 2 = model tests skipped)."""
+    results = []
+
+    def check(name, ok, detail=""):
+        results.append(bool(ok))
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  -> {detail}" if detail and not ok else ""))
+
+    def fixed(hits):
+        return lambda q, k: list(hits)
+
+    print("\n1. Logic with made-up chunks (no model needed)")
+    check("source IDs come from the chunks, in order, without repeats",
+          extract_source_ids([LINEN_CARE, LINEN_PLAIN_CARE, LINEN_CARE]) == ["IW-FAB-015", "IW-FAB-014"])
+    prompt = build_prompt("How do I wash the linen blend?", [LINEN_CARE, LINEN_PLAIN_CARE])
+    check("prompt contains the question, every chunk, its ID and the 'I don't know' rule",
+          all(x in prompt for x in ["How do I wash the linen blend?", LINEN_CARE["text"], LINEN_PLAIN_CARE["text"],
+                                    "IW-FAB-015", "IW-FAB-014", "I don't know"]))
+    r = answer_question("How do I wash the linen blend?", retriever=fixed([]))
+    check("no chunks found -> \"I don't know\", no sources", r["answer"].startswith("I don't know") and r["sources"] == []
+          and not r["confident"], str(r["answer"]))
+    r = answer_question("something unrelated", min_score=0.30,
+                        retriever=fixed([_hit("IW-FAB-001", "Cotton Poplin 120", "care", "x", 0.12)]))
+    check("best match too weak -> \"I don't know\", no sources", r["answer"].startswith("I don't know") and r["sources"] == [])
+    r_default = answer_question("q", retriever=fixed([WEAK_OVERVIEW]), min_score=0.30)
+    r_strict = answer_question("q", retriever=fixed([WEAK_OVERVIEW]), min_score=0.50)
+    check("the min_score setting is respected", r_default["confident"] and not r_strict["confident"])
+    r = answer_question("How do I wash the linen blend?", retriever=fixed([LINEN_CARE, LINEN_PLAIN_CARE]))
+    text = format_answer(r)
+    check("template answer states the care text and cites the right source",
+          "Machine wash cold" in text and "[IW-FAB-015]" in text and r["sources"][0] == "IW-FAB-015"
+          and "Source" in text.splitlines()[-1], text)
+    r = answer_question("How do I wash the linen blend?", min_score=0.30,
+                        retriever=fixed([LINEN_CARE, LINEN_OVERVIEW, dict(LINEN_PLAIN_CARE, score=0.55)]))
+    check("a care question lists only care chunks (no specification or origin of the same fabric)",
+          [h["section"] for h in r["chunks"]] == ["care", "care"] and r["sources"] == ["IW-FAB-015", "IW-FAB-014"], str(r["chunks"]))
+    r = answer_question("What is the composition of silk twill?", retriever=fixed([SILK_ORIGIN, SILK_OVERVIEW]))
+    check("a composition question puts the specification chunk first (not the origin chunk)",
+          r["chunks"][0]["section"] == "overview" and "100% Silk" in r["answer"].splitlines()[0])
+    far = _hit("IW-FAB-001", "Cotton Poplin 120", "overview", "Cotton Poplin 120 (IW-FAB-001). Composition: 100% Cotton.", 0.35)
+    r = answer_question("What is the composition of silk twill?", retriever=fixed([SILK_ORIGIN, far]))
+    check("the right-kind-of-chunk rule does not promote a much weaker match", r["chunks"][0]["fabric_id"] == "IW-FAB-023")
+
+    good = "Machine wash cold, do not bleach [IW-FAB-015]."
+    r = answer_question("How do I wash the linen blend?", mode="llm", retriever=fixed([LINEN_CARE]), llm=lambda p: good)
+    check("LLM answer with a valid citation is accepted; sources are the cited IDs",
+          r["mode"] == "llm" and r["answer"] == good and r["sources"] == ["IW-FAB-015"])
+    r = answer_question("How do I wash the linen blend?", mode="llm", retriever=fixed([LINEN_CARE]),
+                        llm=lambda p: "Machine wash cold [IW-FAB-999].")
+    check("LLM answer citing an ID we never retrieved is rejected",
+          r["mode"] == "template" and r["sources"] == ["IW-FAB-015"] and "rejected" in r["note"], str(r["sources"]))
+    r = answer_question("How do I wash the linen blend?", mode="llm", retriever=fixed([LINEN_CARE]),
+                        llm=lambda p: "Machine wash cold.")
+    check("LLM answer with no citation is rejected", r["mode"] == "template" and r["sources"] == ["IW-FAB-015"])
+    r = answer_question("How do I wash the linen blend?", mode="llm", retriever=fixed([LINEN_CARE]),
+                        llm=lambda p: "I don't know.")
+    check("LLM saying \"I don't know\" is respected", r["answer"].startswith("I don't know") and r["sources"] == [])
+
+    def broken(prompt):
+        raise EngineError("could not reach the LLM server")
+    r = answer_question("How do I wash the linen blend?", mode="llm", retriever=fixed([LINEN_CARE]), llm=broken)
+    check("LLM unavailable -> falls back to the template answer with a note",
+          r["mode"] == "template" and r["sources"] == ["IW-FAB-015"] and "not available" in r["note"])
+
+    # a tiny local server that behaves like an OpenAI-compatible LLM endpoint
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    seen = {}
+
+    class FakeLLM(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.update(path=self.path, model=body["model"], prompt=body["messages"][0]["content"],
+                        auth=self.headers.get("Authorization"))
+            status, reply = (500, b"{}") if "FAIL" in body["messages"][0]["content"] else (
+                200, json.dumps({"choices": [{"message": {"content": " Machine wash cold [IW-FAB-015]. "}}]}).encode())
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), FakeLLM)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}/v1"
+    try:
+        reply = call_llm(build_prompt("How do I wash the linen blend?", [LINEN_CARE]), base_url=base, model="test-model", api_key="k123")
+        check("LLM call works against an OpenAI-compatible server (path, model, key, prompt, reply)",
+              reply == "Machine wash cold [IW-FAB-015]." and seen["path"] == "/v1/chat/completions"
+              and seen["model"] == "test-model" and seen["auth"] == "Bearer k123" and LINEN_CARE["text"] in seen["prompt"], str(seen))
+        try:
+            call_llm("FAIL please", base_url=base)
+            check("LLM server error raises a clear EngineError", False, "no error raised")
+        except EngineError as e:
+            check("LLM server error raises a clear EngineError", "HTTP 500" in str(e))
+    finally:
+        server.shutdown()
+
+    print("\n2. Loading the local embedding model")
+    try:
+        embedder = Embedder()
+    except SetupError as e:
+        print(f"  [SKIPPED] tests with real search: {e}")
+        passed = sum(results)
+        print(f"\n{passed}/{len(results)} checks passed (the real-search tests were skipped).")
+        return 2 if passed == len(results) else 1
+    print(f"  model: {embedder.name} (runs locally, no API key)")
+
+    db_dir = pathlib.Path(tempfile.mkdtemp(prefix="indus_ae_test_"))
+    try:
+        build_store(db_dir, embedder=embedder)
+        print("\n3. Real questions against a freshly built vector store (the right source ID must be cited)")
+
+        def ask(q):
+            r = answer_question(q, db_dir=db_dir, embedder=embedder)
+            print("       " + format_answer(r).replace("\n", "\n       "))
+            return r
+
+        q = "How do I wash the linen blend?"
+        r = ask(q)
+        check(f'"{q}" -> Machine wash cold, Source IW-FAB-015',
+              r["confident"] and r["sources"][0] == "IW-FAB-015" and "Machine wash cold" in r["answer"], str(r["sources"]))
+        q = "What is the care instruction for cotton?"
+        r = ask(q)
+        check(f'"{q}" -> cites a cotton fabric',
+              r["confident"] and "cotton" in r["chunks"][0]["fabric_name"].lower() and r["chunks"][0]["section"] == "care")
+        q = "Which fabric is dry clean only?"
+        r = ask(q)
+        check(f'"{q}" -> cites a dry-clean fabric (IW-FAB-020, 021 or 023)',
+              r["confident"] and bool(set(r["sources"]) & {"IW-FAB-020", "IW-FAB-021", "IW-FAB-023"}), str(r["sources"]))
+        q = "Does the merino wool twill have a certification?"
+        r = ask(q)
+        check(f'"{q}" -> IW-FAB-022, Responsible Wool Standard',
+              r["confident"] and "IW-FAB-022" in r["sources"] and "Responsible Wool Standard" in r["answer"], str(r["sources"]))
+        q = "What is the composition of silk twill?"
+        r = ask(q)
+        check(f'"{q}" -> 100% Silk, Source IW-FAB-023',
+              r["confident"] and r["sources"][0] == "IW-FAB-023" and "100% Silk" in r["answer"], str(r["sources"]))
+        q = "What is the capital of France?"
+        r = ask(q)
+        check(f'"{q}" (not in the data) -> "I don\'t know"', r["answer"].startswith("I don't know") and r["sources"] == [],
+              f"best score was {r['top_score']}; run 'python ezitech.py calibrate'")
+    finally:
+        shutil.rmtree(db_dir, ignore_errors=True)
+
+    passed = sum(results)
+    print(f"\n{passed}/{len(results)} checks passed.")
+    return 0 if passed == len(results) else 1
+
+
+# =====================================================================
+# 7. CALIBRATE  (python ezitech.py calibrate)
+# =====================================================================
+IN_SCOPE = ["How do I wash the linen blend?", "What is the care instruction for cotton?",
+            "Which fabric is dry clean only?", "What is the composition of silk twill?",
+            "Which fabric uses Australian merino yarn?", "Can I use fabric softener on stretch denim?",
+            "Where is the denim woven?", "How heavy is the cotton canvas?"]
+OUT_OF_SCOPE = ["What is the capital of France?", "Who won the cricket world cup?", "How do I bake a chocolate cake?",
+                "What is the stock price of Apple?", "Tell me a joke"]
+
+
+def run_calibrate(db_dir, embedder=None):
+    embedder = embedder or Embedder()
+    print(f"Best-match score for each question (current cut-off: {MIN_SCORE}). Higher = closer match.\n")
+    scores = {}
+    for label, questions in (("IN the data", IN_SCOPE), ("NOT in the data", OUT_OF_SCOPE)):
+        scores[label] = []
+        for q in questions:
+            top = retrieve(q, 1, db_dir=db_dir, embedder=embedder)
+            s = top[0]["score"] if top else 0.0
+            scores[label].append(s)
+            print(f"  {label:<16} {s:>6.3f}  {q}")
+    lowest_in, highest_out = min(scores["IN the data"]), max(scores["NOT in the data"])
+    print(f"\nLowest score for questions in the data:   {lowest_in:.3f}")
+    print(f"Highest score for questions NOT in data:  {highest_out:.3f}")
+    if lowest_in > highest_out:
+        suggestion = round((lowest_in + highest_out) / 2, 2)
+        print(f"\nThe two groups are separated. A good cut-off is about {suggestion}.")
+        print(f"Use it with:  python ezitech.py ask \"...\" --min-score {suggestion}")
+        print(f"or set it for good:  MIN_SCORE={suggestion}  (environment variable)")
+    else:
+        print("\nThe groups overlap, so no single cut-off separates them perfectly. Choose between them and")
+        print("expect some wrong answers, or use mode llm, which can say \"I don't know\" itself.")
+
+
+# =====================================================================
+# TASK 4: WEB APP  (streamlit run app.py   or   python ezitech.py web)
+# =====================================================================
+EXAMPLE_QUESTIONS = ["How do I wash the linen blend?", "What is the composition of silk twill?",
+                     "Which fabric is dry clean only?", "Does the merino wool twill have a certification?"]
+_ENGINE = {}                      # the model is loaded once and shared by every visitor
+_ENGINE_LOCK = threading.Lock()
+
+
+def get_web_embedder(db_dir=DEFAULT_DB_DIR):
+    """Load the embedding model once. Build the vector store first if it is missing or out of date."""
+    with _ENGINE_LOCK:
+        if "embedder" not in _ENGINE:
+            embedder = Embedder()
+            specs = load_specs()
+            try:
+                collection = open_collection(db_dir)
+                up_to_date = (collection.count() == 3 * len(specs)
+                              and (collection.metadata or {}).get("embedding_model") == embedder.name)
+            except SetupError:
+                up_to_date = False
+            if not up_to_date:
+                build_store(db_dir, embedder=embedder, specs=specs)
+            _ENGINE["embedder"] = embedder
+        return _ENGINE["embedder"]
+
+
+def _md(text):
+    """Make plain text safe to show as markdown (keeps [IW-FAB-015] and line breaks as written)."""
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]").replace("\n", "  \n")
+
+
+def web_app():
+    """The web page: a text box, and the answer with its sources below it."""
+    import streamlit as st
+
+    st.set_page_config(page_title="Indus Weaves Spec Search", page_icon="\U0001F9F5")
+    st.title("Indus Weaves Spec Search")
+    st.caption("Ask about fabric composition, care or origin. Every answer shows the spec entry it came from.")
+
+    try:
+        with st.spinner("Starting up: loading the search model and the vector store (the first start can take a minute)..."):
+            embedder = get_web_embedder()
+    except SetupError as e:
+        st.error(str(e))
+        st.stop()
+
+    st.session_state.setdefault("question", "")
+
+    def use_example(q):
+        st.session_state.question = q
+        st.session_state.run_example = True
+
+    with st.form("ask"):
+        st.text_input("Your question", key="question", placeholder="e.g. How do I wash the linen blend?")
+        submitted = st.form_submit_button("Ask")
+    st.caption("Try an example:")
+    for col, q in zip(st.columns(2), EXAMPLE_QUESTIONS[:2]):
+        col.button(q, on_click=use_example, args=(q,), key="ex_" + q, use_container_width=True)
+    for col, q in zip(st.columns(2), EXAMPLE_QUESTIONS[2:]):
+        col.button(q, on_click=use_example, args=(q,), key="ex_" + q, use_container_width=True)
+
+    question = st.session_state.question.strip()
+    run = submitted or st.session_state.pop("run_example", False)
+    if run and not question:
+        st.info("Type a question first.")
+    elif run:
+        mode = "llm" if os.getenv("LLM_BASE_URL") else "template"  # an LLM is used only if one is configured
+        try:
+            result = answer_question(question, mode=mode, db_dir=DEFAULT_DB_DIR, embedder=embedder)
+        except (SetupError, EngineError) as e:
+            st.error(f"Something went wrong: {e}")
+            st.stop()
+        if not result["sources"]:
+            st.warning(result["answer"])
+        else:
+            st.success(_md(result["answer"]))
+            names = {h["fabric_id"]: h["fabric_name"] for h in result["chunks"]}
+            label = "Source" if len(result["sources"]) == 1 else "Sources"
+            st.markdown(f"**{label}:** " + ", ".join(f"`{i}` ({names[i]})" if i in names else f"`{i}`"
+                                                    for i in result["sources"]))
+        if result["note"]:
+            st.info(result["note"])
+        if result["chunks"]:
+            with st.expander("Show the spec text this answer is based on"):
+                for h in result["chunks"]:
+                    st.markdown(f"**{h['fabric_id']}** \u00b7 {h['section']} \u00b7 match {h['score']}")
+                    st.caption(_md(h["text"]))
+    st.divider()
+    st.caption("Sample data only: these are not real Indus Weaves specifications.")
+
+
+def cmd_web(args):
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        raise SetupError("streamlit is not installed. Run: pip install -r requirements.txt")
+    import subprocess
+    sys.exit(subprocess.call([sys.executable, "-m", "streamlit", "run", str(HERE / "app.py")]))
+
+
+# =====================================================================
+# COMMAND LINE
+# =====================================================================
+DEMO_QUESTIONS = ["How do I wash the linen blend?", "Which fabric is dry clean only?",
+                  "Does the merino wool twill have a certification?", "What is the capital of France?"]
+
+
+def cmd_ask(args, embedder=None):
+    result = answer_question(args.question, mode=args.mode, min_score=args.min_score,
+                             db_dir=args.db_dir, embedder=embedder)
+    print("\n" + format_answer(result))
+    if args.verbose:
+        print(f"\n[mode: {result['mode']} | best match score: {result['top_score']} | chunks used: {len(result['chunks'])}]")
+        for h in result["chunks"]:
+            print(f"  {h['score']:.3f}  [{h['fabric_id']} | {h['section']}]  {h['text']}")
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    ap = argparse.ArgumentParser(description="Indus Weaves fabric spec search: vector store + answers with sources.")
+    ap.add_argument("--db-dir", default=str(DEFAULT_DB_DIR), help="where the database is stored (default: chroma_db/)")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("build", help="(re)build the vector store from data/fabric_specs.json")
+    sub.add_parser("test", help="run all built-in checks (temporary store, your chroma_db/ is untouched)")
+    sub.add_parser("calibrate", help="help choose the 'too weak' cut-off using your real model")
+    sub.add_parser("web", help="start the web page (Task 4)")
+    sp = sub.add_parser("search", help="show the closest raw chunks (Task 2)")
+    sp.add_argument("question")
+    sp.add_argument("-n", type=int, default=3, help="how many results (default 3)")
+    sp.add_argument("--category", help="only search one category, e.g. cotton, blend, wool, silk")
+    ap_ask = sub.add_parser("ask", help="answer a question with source IDs (Task 3)")
+    ap_ask.add_argument("question")
+    ap_ask.add_argument("--mode", choices=["template", "llm"], default=os.getenv("ANSWER_MODE", "template"),
+                        help="template (default, no LLM) or llm (free LLM, see README)")
+    ap_ask.add_argument("--min-score", type=float, default=None, help=f"weakest match we still answer from (default {MIN_SCORE})")
+    ap_ask.add_argument("-v", "--verbose", action="store_true", help="show the chunks and scores used")
+    args = ap.parse_args()
+
+    try:
+        if args.cmd == "build":
+            cmd_build(args)
+        elif args.cmd == "search":
+            cmd_search(args)
+        elif args.cmd == "ask":
+            cmd_ask(args)
+        elif args.cmd == "calibrate":
+            run_calibrate(args.db_dir)
+        elif args.cmd == "web":
+            cmd_web(args)
+        elif args.cmd == "test":
+            print("=== PART 1: vector store checks ===")
+            code1 = run_store_tests()
+            print("\n=== PART 2: answer engine checks ===")
+            code2 = run_answer_tests()
+            sys.exit(max(code1, code2) if 1 not in (code1, code2) else 1)
+        else:  # no command: build, then answer the demo questions
+            embedder = cmd_build(args)
+            for q in DEMO_QUESTIONS:
+                print(f"\nQ: {q}")
+                print("A: " + format_answer(answer_question(q, db_dir=args.db_dir, embedder=embedder)).replace("\n", "\n   "))
+    except (SetupError, EngineError) as e:
+        sys.exit(f"\nError: {e}")
+
+
+if __name__ == "__main__":
+    main()
