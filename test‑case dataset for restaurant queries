@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Generate test_cases.json: sample guest questions and the exact answer Spice Route wants to give.
+
+This file is the test set for the LLM evaluation project (Task 1). The evaluation script (Task 2)
+asks a language model each `question` and the scoring module (Task 3) compares its reply with
+`expected_answer`.
+
+    python generate_test_cases.py             write test_cases.json (next to this script) and check it
+    python generate_test_cases.py --check     only check an existing test_cases.json (after a manual edit)
+    python generate_test_cases.py --out FILE  write to a different file
+
+To add a case, copy one block in CASES below, edit it, and run the script again (see README.md).
+
+IMPORTANT: every restaurant fact below (hours, prices, policies, dishes) is INVENTED SAMPLE DATA so
+the tool can be built and tested. Replace the answers with Spice Route's real policies before the
+results are used to judge a model.
+
+Needs only Python 3.8+ and no extra packages.
+"""
+import argparse
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+DEFAULT_OUT = HERE / "test_cases.json"
+
+MIN_CASES, MAX_CASES = 20, 100   # sanity limits on the number of cases
+MAX_ANSWER_CHARS = 450           # an ideal answer is short enough for a guest to read at a glance
+
+CATEGORIES = ["hours", "location", "reservations", "dietary", "menu", "pricing", "payment", "services",
+              "policies", "out_of_scope"]
+
+# ---------------------------------------------------------------------------------------------
+# THE TEST CASES - edit here.
+#   category     one of CATEGORIES above (groups the results in the dashboard later)
+#   question     what a guest would type
+#   answer       the exact answer the restaurant wants to give (1 to 3 sentences, plain text)
+#   key_facts    the short phrases a correct answer MUST contain. Each one has to appear word for
+#                word inside `answer` (the script checks this). The scoring module uses them to
+#                judge accuracy, so keep them to the facts that matter: numbers, times, names.
+# IDs (SR-001, SR-002, ...) are assigned automatically in the order written here.
+# ---------------------------------------------------------------------------------------------
+CASES = [
+    # --- opening hours ---------------------------------------------------------------------
+    {
+        "category": "hours",
+        "question": "What are your opening hours?",
+        "answer": "We are open Monday to Thursday from 12:00 pm to 11:00 pm, and Friday to Sunday "
+                  "from 12:00 pm to midnight.",
+        "key_facts": ["Monday to Thursday", "12:00 pm to 11:00 pm", "Friday to Sunday", "midnight"],
+    },
+    {
+        "category": "hours",
+        "question": "Are you open on public holidays?",
+        "answer": "Yes, we are open on most public holidays during our normal hours. The only day we are "
+                  "closed is the first day of Eid, so please call us to confirm our Eid hours.",
+        "key_facts": ["most public holidays", "first day of Eid"],
+    },
+    {
+        "category": "hours",
+        "question": "What time is the last order?",
+        "answer": "Our kitchen takes last orders 30 minutes before closing, so at 10:30 pm from Monday to "
+                  "Thursday and at 11:30 pm from Friday to Sunday.",
+        "key_facts": ["30 minutes before closing", "10:30 pm", "11:30 pm"],
+    },
+    # --- location --------------------------------------------------------------------------
+    {
+        "category": "location",
+        "question": "Where are you located, and is there parking?",
+        "answer": "We are at 24 Garden Road, Old Town, next to the clock tower. There is free parking for "
+                  "about 40 cars behind the building, and valet parking is available on Friday to Sunday "
+                  "evenings.",
+        "key_facts": ["24 Garden Road", "free parking", "valet parking"],
+    },
+    # --- reservations ----------------------------------------------------------------------
+    {
+        "category": "reservations",
+        "question": "How do I make a reservation?",
+        "answer": "You can reserve by calling (051) 555-0142, by emailing reservations@spiceroute.example, "
+                  "or through the booking form on our website. Please give us your name, phone number, "
+                  "date, time and number of guests.",
+        "key_facts": ["(051) 555-0142", "reservations@spiceroute.example", "booking form on our website"],
+    },
+    {
+        "category": "reservations",
+        "question": "Do I need a reservation, or can I just walk in?",
+        "answer": "Walk-ins are always welcome, subject to availability. We recommend booking ahead for "
+                  "Friday to Sunday evenings, when we are usually full.",
+        "key_facts": ["Walk-ins are always welcome", "booking ahead", "Friday to Sunday evenings"],
+    },
+    {
+        "category": "reservations",
+        "question": "How long will you hold my table if I am running late?",
+        "answer": "We hold your table for 15 minutes after your reservation time. If you will be later than "
+                  "that, please call us and we will do our best to keep it.",
+        "key_facts": ["15 minutes", "call us"],
+    },
+    {
+        "category": "reservations",
+        "question": "What is your cancellation policy?",
+        "answer": "You can cancel or change a reservation for free up to 2 hours before your booking time. "
+                  "For groups of 8 or more, we need 24 hours' notice.",
+        "key_facts": ["free up to 2 hours", "groups of 8 or more", "24 hours' notice"],
+    },
+    {
+        "category": "reservations",
+        "question": "Do you take large group bookings?",
+        "answer": "Yes. For groups of 8 or more, please book at least 24 hours ahead. Our largest table seats "
+                  "14 guests, and for bigger parties we can use our private room, which seats up to 20.",
+        "key_facts": ["at least 24 hours ahead", "seats 14", "up to 20"],
+    },
+    # --- dietary needs ---------------------------------------------------------------------
+    {
+        "category": "dietary",
+        "question": "What vegan options do you have?",
+        "answer": "Our vegan dishes are Chana Masala, Dal Tadka, Aloo Gobi, Vegetable Samosa and Tandoori "
+                  "Roti, all marked (VG) on the menu. Please note that our naan, Dal Makhani and paneer "
+                  "dishes contain dairy, so they are not vegan.",
+        "key_facts": ["Chana Masala", "Dal Tadka", "Aloo Gobi", "Vegetable Samosa", "Tandoori Roti", "naan"],
+    },
+    {
+        "category": "dietary",
+        "question": "Do you have vegetarian dishes?",
+        "answer": "Yes, about 40% of our menu is vegetarian, including Paneer Tikka, Saag Paneer, Dal Makhani "
+                  "and Vegetable Biryani. Vegetarian dishes are marked (V) and vegan dishes (VG) on the menu.",
+        "key_facts": ["40% of our menu", "Paneer Tikka", "Saag Paneer"],
+    },
+    {
+        "category": "dietary",
+        "question": "Is your food halal?",
+        "answer": "Yes, all of our meat is halal certified, and we do not serve pork.",
+        "key_facts": ["halal certified", "do not serve pork"],
+    },
+    {
+        "category": "dietary",
+        "question": "Do you have gluten-free options?",
+        "answer": "Many of our grilled and curry dishes, such as Tandoori Chicken, Chana Masala and Aloo "
+                  "Gobi, are made without wheat. However, our kitchen also handles wheat, so we cannot "
+                  "guarantee that any dish is completely gluten-free. Please tell your server about your "
+                  "needs.",
+        "key_facts": ["Tandoori Chicken", "cannot guarantee", "tell your server"],
+    },
+    {
+        "category": "dietary",
+        "question": "I have a nut allergy. Is it safe to eat here?",
+        "answer": "Please tell your server about your allergy when you order, and we will guide you to "
+                  "suitable dishes. Butter Chicken, Chicken Korma and Kheer contain nuts, and because our "
+                  "kitchen handles nuts we cannot guarantee that any dish is completely nut-free.",
+        "key_facts": ["tell your server", "Butter Chicken", "Chicken Korma", "Kheer", "cannot guarantee"],
+    },
+    # --- menu recommendations --------------------------------------------------------------
+    {
+        "category": "menu",
+        "question": "What do you recommend for a first-time visitor?",
+        "answer": "For two people, we recommend our Mixed Tandoori Platter, a Lamb Biryani to share, Garlic "
+                  "Naan and a Mango Lassi each. Vegetarians often enjoy the Paneer Tikka with Saag Paneer.",
+        "key_facts": ["Mixed Tandoori Platter", "Lamb Biryani", "Garlic Naan", "Mango Lassi"],
+    },
+    {
+        "category": "menu",
+        "question": "What is your signature dish?",
+        "answer": "Our signature dish is the Lamb Biryani, slow-cooked in a sealed pot with saffron and whole "
+                  "spices and served with raita. It costs Rs. 1,450.",
+        "key_facts": ["Lamb Biryani", "slow-cooked", "Rs. 1,450"],
+    },
+    {
+        "category": "menu",
+        "question": "Which dishes are not too spicy?",
+        "answer": "Our mildest dishes are Butter Chicken, Chicken Korma and Dal Makhani. You can also ask "
+                  "for any curry to be made mild, medium or hot when you order.",
+        "key_facts": ["Butter Chicken", "Chicken Korma", "Dal Makhani", "mild, medium or hot"],
+    },
+    {
+        "category": "menu",
+        "question": "Do you have a kids' menu?",
+        "answer": "Yes, for children under 12 we offer Mini Chicken Tikka with fries, mild Butter Chicken "
+                  "with rice, and a Cheese Naan, each for Rs. 650. High chairs are available on request.",
+        "key_facts": ["under 12", "Rs. 650", "High chairs"],
+    },
+    # --- pricing ---------------------------------------------------------------------------
+    {
+        "category": "pricing",
+        "question": "How much does a typical meal cost per person?",
+        "answer": "Most guests spend between Rs. 1,800 and Rs. 2,500 per person for a main dish, bread and a "
+                  "drink. Our main dishes start at Rs. 1,100.",
+        "key_facts": ["Rs. 1,800", "Rs. 2,500", "start at Rs. 1,100"],
+    },
+    {
+        "category": "pricing",
+        "question": "Do you offer a lunch deal?",
+        "answer": "Yes, our lunch set is available Monday to Friday from 12:00 pm to 3:00 pm for Rs. 1,250. "
+                  "It includes a main dish, bread and a soft drink.",
+        "key_facts": ["Monday to Friday", "12:00 pm to 3:00 pm", "Rs. 1,250"],
+    },
+    # --- payment ---------------------------------------------------------------------------
+    {
+        "category": "payment",
+        "question": "What payment methods do you accept?",
+        "answer": "We accept cash, Visa and Mastercard debit and credit cards, and mobile wallet payments. "
+                  "We do not accept cheques or cryptocurrency.",
+        "key_facts": ["cash", "Visa and Mastercard", "mobile wallet", "cryptocurrency"],
+    },
+    {
+        "category": "payment",
+        "question": "Do you add a service charge?",
+        "answer": "A 10% service charge is added to tables of 6 or more guests. For smaller tables there is "
+                  "no service charge, and tipping is optional.",
+        "key_facts": ["10% service charge", "6 or more", "tipping is optional"],
+    },
+    # --- services --------------------------------------------------------------------------
+    {
+        "category": "services",
+        "question": "Do you offer takeaway or delivery?",
+        "answer": "Yes to both. Takeaway orders by phone or on our website are ready in about 25 minutes. "
+                  "We deliver within 6 km for a fee of Rs. 250, and delivery is free for orders over "
+                  "Rs. 4,000.",
+        "key_facts": ["25 minutes", "within 6 km", "Rs. 250", "over Rs. 4,000"],
+    },
+    {
+        "category": "services",
+        "question": "Can I bring my own birthday cake?",
+        "answer": "Yes, you are welcome to bring a celebration cake. We will keep it chilled, plate it and "
+                  "serve it with candles for a cake-handling fee of Rs. 500. No other outside food or drink "
+                  "is allowed.",
+        "key_facts": ["celebration cake", "Rs. 500", "No other outside food"],
+    },
+    {
+        "category": "services",
+        "question": "Do you have a private room for events?",
+        "answer": "Yes, our private room seats up to 20 guests. It is available with a set menu from "
+                  "Rs. 2,800 per person, and we ask you to book at least 3 days ahead.",
+        "key_facts": ["seats up to 20", "Rs. 2,800 per person", "3 days ahead"],
+    },
+    {
+        "category": "services",
+        "question": "Is the restaurant wheelchair accessible?",
+        "answer": "Yes. We are on the ground floor with a step-free entrance, and we have an accessible "
+                  "restroom. Please tell us when you book if you need extra space at your table.",
+        "key_facts": ["ground floor", "step-free entrance", "accessible restroom"],
+    },
+    # --- policies --------------------------------------------------------------------------
+    {
+        "category": "policies",
+        "question": "Do you serve alcohol?",
+        "answer": "No, we do not serve alcohol. We offer fresh juices, Mango Lassi, mocktails and our house "
+                  "masala chai instead.",
+        "key_facts": ["do not serve alcohol", "Mango Lassi", "mocktails"],
+    },
+    {
+        "category": "policies",
+        "question": "Are pets allowed?",
+        "answer": "Pets are not allowed in the restaurant, except for service animals.",
+        "key_facts": ["Pets are not allowed", "service animals"],
+    },
+    # --- questions the restaurant cannot answer: a good reply must NOT invent anything -----
+    {
+        "category": "out_of_scope",
+        "question": "Can you recommend a good hotel nearby?",
+        "answer": "I am sorry, we cannot recommend specific hotels. Our team on (051) 555-0142 will be happy "
+                  "to give you directions to the restaurant from wherever you are staying.",
+        "key_facts": ["cannot recommend specific hotels", "(051) 555-0142"],
+    },
+]
+
+
+def build_cases():
+    """Turn the CASES block into the entries written to the JSON file (adds the IDs)."""
+    return [
+        {
+            "id": f"SR-{i:03d}",
+            "category": c["category"],
+            "question": c["question"].strip(),
+            "expected_answer": c["answer"].strip(),
+            "key_facts": list(c["key_facts"]),
+        }
+        for i, c in enumerate(CASES, start=1)
+    ]
+
+
+def validate(entries):
+    """Return a list of problems (empty list = the data is fine)."""
+    problems = []
+    if not isinstance(entries, list):
+        return ["the file must contain a list of test cases"]
+    if not MIN_CASES <= len(entries) <= MAX_CASES:
+        problems.append(f"expected {MIN_CASES}-{MAX_CASES} test cases, found {len(entries)}")
+    for field in ("id", "question"):
+        values = [e.get(field) for e in entries if isinstance(e, dict)]
+        if len(set(values)) != len(values):
+            problems.append(f"duplicate {field} values")
+    for n, e in enumerate(entries, start=1):
+        if not isinstance(e, dict):
+            problems.append(f"entry {n}: not an object")
+            continue
+        label = e.get("id") or f"entry {n}"
+        for field in ("id", "question", "expected_answer"):
+            if not isinstance(e.get(field), str) or not e[field].strip():
+                problems.append(f"{label}: '{field}' is missing or empty")
+        if e.get("category") not in CATEGORIES:
+            problems.append(f"{label}: category '{e.get('category')}' is not one of {CATEGORIES}")
+        question, answer = e.get("question") or "", e.get("expected_answer") or ""
+        if question and not question.rstrip().endswith("?"):
+            problems.append(f"{label}: the question should end with '?'")
+        if len(answer) > MAX_ANSWER_CHARS:
+            problems.append(f"{label}: the answer is {len(answer)} characters (limit {MAX_ANSWER_CHARS})")
+        facts = e.get("key_facts")
+        if not isinstance(facts, list) or not facts or not all(isinstance(f, str) and f.strip() for f in facts):
+            problems.append(f"{label}: 'key_facts' must be a list with at least one phrase")
+        else:
+            for fact in facts:
+                if fact.lower() not in answer.lower():
+                    problems.append(f"{label}: key fact '{fact}' does not appear word for word in the answer")
+    return problems
+
+
+def print_summary(entries):
+    counts = {}
+    for e in entries:
+        counts[e["category"]] = counts.get(e["category"], 0) + 1
+    print(f"{len(entries)} test cases:")
+    for category in CATEGORIES:
+        if category in counts:
+            print(f"  {category:<13} {counts[category]}")
+    print("\nFirst three:")
+    for e in entries[:3]:
+        print(f"  {e['id']}  Q: {e['question']}\n          A: {e['expected_answer']}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Write and check test_cases.json for the Spice Route evaluation.")
+    ap.add_argument("--out", default=str(DEFAULT_OUT), help="file to write or check (default: test_cases.json)")
+    ap.add_argument("--check", action="store_true", help="only check an existing file, do not write")
+    args = ap.parse_args()
+    out = pathlib.Path(args.out)
+
+    if args.check:
+        if not out.exists():
+            sys.exit(f"{out} not found. Run 'python generate_test_cases.py' first.")
+        try:
+            entries = json.loads(out.read_text(encoding="utf-8"))
+        except ValueError as e:
+            sys.exit(f"{out} is not valid JSON: {e}")
+    else:
+        entries = build_cases()
+
+    problems = validate(entries)
+    if problems:
+        print("The test cases have problems, so nothing was written:" if not args.check else
+              f"{out} has problems:")
+        for p in problems:
+            print("  -", p)
+        sys.exit(1)
+
+    if not args.check:
+        out.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Saved {len(entries)} test cases to {out}\n")
+    print_summary(entries)
+    print("\nAll checks passed. (Sample restaurant facts: replace with Spice Route's real policies.)")
+
+
+if __name__ == "__main__":
+    main()
