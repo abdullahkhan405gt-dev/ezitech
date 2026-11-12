@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Spice Route LLM evaluation - Task 2: send every test question to an LLM and
+store the raw answers.
+
+    python run_evaluation.py                  # auto: OpenAI if a key is set, else local model
+    python run_evaluation.py --limit 3        # quick test on the first 3 cases
+    python run_evaluation.py --backend local  # force the local transformers model
+    python run_evaluation.py --backend mock   # offline pipeline test (NOT a real model)
+
+Reads  test_cases.json   (made by generate_test_cases.py)
+Writes raw_results.json  (id, question, model_answer, timestamp, ...)
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+# =============================================================================
+# CONFIG  - edit here, or override with environment variables / CLI flags
+# =============================================================================
+BACKEND = os.environ.get("EVAL_BACKEND", "auto")   # auto | openai | local | mock
+
+# --- OpenAI ---
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # or paste "sk-..." (never commit it)
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+# --- Local model ---
+# distilbert-base-uncased is a *masked* model and cannot generate text.
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+
+# --- Generation settings ---
+MAX_NEW_TOKENS = 150
+TEMPERATURE = 0.0
+USE_RESTAURANT_INFO = True
+SYSTEM_PROMPT = (
+    "You are the friendly assistant of Spice Route, a restaurant. Answer the guest's "
+    "question in one to three short sentences, using only the restaurant facts below. "
+    "If the facts do not contain the answer, say you are not sure and suggest they call "
+    "the restaurant."
+)
+
+# --- Files ---
+TEST_CASES_FILE = HERE / "test_cases.json"
+INFO_FILE = HERE / "restaurant_info.txt"
+OUTPUT_FILE = HERE / "raw_results.json"
+
+REQUEST_TIMEOUT = 60
+MAX_RETRIES = 4
+# =============================================================================
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def build_system_prompt(use_info=USE_RESTAURANT_INFO):
+    if use_info and INFO_FILE.exists():
+        return SYSTEM_PROMPT + "\n\nRESTAURANT FACTS:\n" + INFO_FILE.read_text(encoding="utf-8")
+    return SYSTEM_PROMPT
+
+
+class OpenAIBackend:
+    name = "openai"
+
+    def __init__(self, api_key, model, base_url):
+        if not api_key:
+            sys.exit("No OpenAI key found. Set OPENAI_API_KEY (see README) or use --backend local.")
+        self.api_key, self.model = api_key, model
+        self.url = base_url.rstrip("/") + "/chat/completions"
+        self.model_label = model
+        if any(h in base_url for h in ("localhost", "127.0.0.1")):
+            self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        else:
+            self.opener = urllib.request.build_opener()
+
+    def ask(self, question, system):
+        body = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": question}],
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_NEW_TOKENS,
+        }).encode()
+        req = urllib.request.Request(self.url, data=body, headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + self.api_key})
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with self.opener.open(req, timeout=REQUEST_TIMEOUT) as r:
+                    data = json.load(r)
+                return data["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    sys.exit("OpenAI rejected the key (401). Check OPENAI_API_KEY.")
+                if e.code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                    time.sleep(2 ** attempt)
+                    continue
+                detail = e.read().decode(errors="replace")[:200]
+                raise RuntimeError(f"OpenAI HTTP {e.code}: {detail}")
+            except urllib.error.URLError as e:
+                if attempt < MAX_RETRIES:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"Network error: {e.reason}")
+
+
+class LocalBackend:
+    name = "local"
+
+    def __init__(self, model):
+        try:
+            from transformers import pipeline
+        except ImportError:
+            sys.exit("Local mode needs: pip install transformers torch")
+        print(f"Loading local model {model} (first run downloads it)...")
+        try:
+            self.pipe = pipeline("text-generation", model=model)
+        except Exception as e:
+            sys.exit(f"Could not load '{model}' as a text-generation model: {e}\n"
+                     "Masked models such as distilbert-base-uncased cannot generate text. "
+                     "Try Qwen/Qwen2.5-0.5B-Instruct or distilgpt2.")
+        self.model_label = model
+        self.tok = self.pipe.tokenizer
+        if self.tok.pad_token_id is None:
+            self.tok.pad_token = self.tok.eos_token
+
+    def make_prompt(self, question, system):
+        if getattr(self.tok, "chat_template", None):
+            return self.tok.apply_chat_template(
+                [{"role": "system", "content": system}, {"role": "user", "content": question}],
+                tokenize=False, add_generation_prompt=True)
+        return f"{system}\n\nQuestion: {question}\nAnswer:"
+
+    def ask(self, question, system):
+        prompt = self.make_prompt(question, system)
+        cfg = self.pipe.model.config
+        limit = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "n_positions", 1024)
+        if len(self.tok(prompt)["input_ids"]) + MAX_NEW_TOKENS > limit:
+            print("        (fact sheet too long for this model - using the short prompt)")
+            prompt = self.make_prompt(question, SYSTEM_PROMPT)
+        kwargs = dict(max_new_tokens=MAX_NEW_TOKENS, return_full_text=False,
+                      pad_token_id=self.tok.pad_token_id)
+        if TEMPERATURE > 0:
+            kwargs.update(do_sample=True, temperature=TEMPERATURE)
+        else:
+            kwargs.update(do_sample=False)
+        text = self.pipe(prompt, **kwargs)[0]["generated_text"]
+        for stop in ("\nQuestion:", "\n\n"):
+            if stop in text.strip():
+                text = text.strip().split(stop)[0]
+        return text.strip()
+
+
+class MockBackend:
+    name = "mock"
+    model_label = "mock (canned replies - not a real model)"
+
+    def ask(self, question, system):
+        return "[MOCK] This is a placeholder reply to: " + question
+
+
+def get_backend(choice, local_model):
+    if choice == "auto":
+        choice = "openai" if OPENAI_API_KEY else "local"
+        print(f"Backend (auto): {choice}")
+    if choice == "openai":
+        return OpenAIBackend(OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL)
+    if choice == "local":
+        return LocalBackend(local_model)
+    if choice == "mock":
+        return MockBackend()
+    sys.exit(f"Unknown backend '{choice}'")
+
+
+def ask_model(question, backend, system):
+    """Send one question to the chosen model and return its answer text."""
+    return backend.ask(question, system)
+
+
+def save(path, backend, system_used, results, finished):
+    doc = {
+        "generated_at": now_iso(),
+        "backend": backend.name,
+        "model": backend.model_label,
+        "temperature": TEMPERATURE,
+        "used_restaurant_info": system_used,
+        "finished": finished,
+        "total": len(results),
+        "errors": sum(1 for r in results if r["error"]),
+        "results": results,
+    }
+    Path(path).write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--backend", choices=["auto", "openai", "local", "mock"], default=BACKEND)
+    ap.add_argument("--local-model", default=LOCAL_MODEL)
+    ap.add_argument("--limit", type=int, help="only the first N test cases")
+    ap.add_argument("--ids", help="comma-separated ids, e.g. SR-001,SR-010")
+    ap.add_argument("--no-info", action="store_true", help="do not give the model restaurant_info.txt")
+    ap.add_argument("--cases", default=str(TEST_CASES_FILE))
+    ap.add_argument("--out", default=str(OUTPUT_FILE))
+    args = ap.parse_args()
+
+    if not Path(args.cases).exists():
+        sys.exit(f"{args.cases} not found. Run: python generate_test_cases.py")
+    cases = json.loads(Path(args.cases).read_text(encoding="utf-8"))
+    if args.ids:
+        wanted = {i.strip() for i in args.ids.split(",")}
+        cases = [c for c in cases if c["id"] in wanted]
+    if args.limit:
+        cases = cases[: args.limit]
+    if not cases:
+        sys.exit("No test cases selected.")
+
+    use_info = USE_RESTAURANT_INFO and not args.no_info and INFO_FILE.exists()
+    system = build_system_prompt(use_info)
+    backend = get_backend(args.backend, args.local_model)
+    print(f"Model: {backend.model_label} | {len(cases)} questions | fact sheet: {'on' if use_info else 'off'}")
+
+    results = []
+    try:
+        for n, case in enumerate(cases, 1):
+            start = time.time()
+            answer, error = "", None
+            try:
+                answer = ask_model(case["question"], backend, system)
+            except Exception as e:
+                error = str(e)
+            results.append({
+                "id": case["id"],
+                "category": case.get("category"),
+                "question": case["question"],
+                "expected_answer": case.get("expected_answer"),
+                "key_facts": case.get("key_facts", []),
+                "model_answer": answer,
+                "timestamp": now_iso(),
+                "latency_seconds": round(time.time() - start, 2),
+                "error": error,
+            })
+            shown = (answer or f"ERROR: {error}").replace("\n", " ")
+            print(f"[{n}/{len(cases)}] {case['id']}  {case['question']}\n        -> {shown[:110]}")
+        save(args.out, backend, use_info, results, finished=True)
+    except KeyboardInterrupt:
+        save(args.out, backend, use_info, results, finished=False)
+        print(f"\nStopped early - saved {len(results)} results.")
+        sys.exit(1)
+
+    errs = sum(1 for r in results if r["error"])
+    print(f"\nSaved {len(results)} results to {args.out} ({errs} errors).")
+    if backend.name == "mock":
+        print("NOTE: mock replies are not real model output. Re-run with openai or local.")
+    sys.exit(1 if errs == len(results) else 0)
+
+
+if __name__ == "__main__":
+    main()
