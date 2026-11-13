@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Spice Route LLM evaluation - Task 3: score the model's answers.
+
+Reads  raw_results.json  (made by run_evaluation.py)
+Writes scores.csv        one row per test case: accuracy (0/1) and similarity (0-1)
+       summary.json      overall metrics (+ per-category averages)
+
+    python scoring.py                 # score raw_results.json with MiniLM embeddings
+    python scoring.py --strict        # exact match with no text clean-up at all
+    python scoring.py --embedder tfidf   # offline stand-in (pipeline test only)
+
+Can also be imported:  from scoring import exact_match, embedding_similarity
+"""
+import argparse
+import json
+import math
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+
+HERE = Path(__file__).resolve().parent
+
+# ----------------------------- CONFIG ----------------------------------------
+INPUT_FILE = HERE / "raw_results.json"
+SCORES_FILE = HERE / "scores.csv"
+SUMMARY_FILE = HERE / "summary.json"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# -----------------------------------------------------------------------------
+
+
+# ------------------------------ metric 1: accuracy ---------------------------
+def normalize(text):
+    """Lower-case, drop punctuation at the edges and collapse spaces."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    return text.strip(" .!?,;:\"'")
+
+
+def exact_match(model_answer, expected_answer, strict=False):
+    """1 if the answer equals the expected answer, else 0.
+
+    By default capitals, extra spaces and end punctuation are ignored, so
+    'We are open daily.' equals 'we are open daily'. strict=True compares the
+    raw strings character for character.
+    """
+    if strict:
+        return int(model_answer == expected_answer)
+    return int(normalize(model_answer) == normalize(expected_answer) and normalize(expected_answer) != "")
+
+
+# ------------------------------ metric 2: similarity -------------------------
+class MiniLMEmbedder:
+    """Sentence embeddings from sentence-transformers (the real metric)."""
+    name = EMBEDDING_MODEL
+
+    def __init__(self, model_name=EMBEDDING_MODEL):
+        from sentence_transformers import SentenceTransformer
+        self.name = model_name
+        self.model = SentenceTransformer(model_name)
+
+    def encode(self, texts):
+        return self.model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False)
+
+
+class TfidfEmbedder:
+    """Offline stand-in (word overlap). Only for testing the pipeline."""
+    name = "tfidf-standin (NOT a sentence embedding)"
+
+    def __init__(self):
+        self.vocab = None
+
+    def encode(self, texts):
+        import numpy as np
+        texts = list(texts)
+        toks = [re.findall(r"[a-z0-9]+", t.lower()) for t in texts]
+        if self.vocab is None:
+            self.vocab = {w: i for i, w in enumerate(sorted({w for t in toks for w in t}))}
+        mat = np.zeros((len(texts), max(len(self.vocab), 1)))
+        for r, t in enumerate(toks):
+            for w in t:
+                if w in self.vocab:
+                    mat[r, self.vocab[w]] += 1
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        return mat / np.where(norms == 0, 1, norms)
+
+
+def cosine(a, b):
+    """Cosine similarity of two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def embedding_similarity(model_answer, expected_answer, embedder):
+    """Cosine similarity of the two sentence embeddings, clipped to 0-1."""
+    a, b = embedder.encode([model_answer, expected_answer])
+    return max(0.0, min(1.0, float(cosine(a, b))))
+
+
+def key_fact_recall(model_answer, key_facts):
+    """Bonus metric: share of the case's key facts found in the answer (0-1)."""
+    if not key_facts:
+        return None
+    ans = normalize(model_answer)
+    return round(sum(normalize(k) in ans for k in key_facts) / len(key_facts), 3)
+
+
+# ------------------------------ pipeline -------------------------------------
+def load_results(path):
+    path = Path(path)
+    if not path.exists():
+        sys.exit(f"{path} not found. Run run_evaluation.py first.")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    rows = doc["results"] if isinstance(doc, dict) else doc  # accept a bare list too
+    return doc if isinstance(doc, dict) else {}, rows
+
+
+def score(rows, embedder, strict=False):
+    """Return a DataFrame with one scored row per result."""
+    answers = [r.get("model_answer") or "" for r in rows]
+    expected = [r.get("expected_answer") or "" for r in rows]
+    # embed everything in two batches (much faster than one pair at a time)
+    emb_a, emb_e = embedder.encode(answers), embedder.encode(expected)
+    records = []
+    for r, a, e, va, ve in zip(rows, answers, expected, emb_a, emb_e):
+        failed = bool(r.get("error")) or not a.strip()
+        records.append({
+            "id": r.get("id"),
+            "category": r.get("category"),
+            "question": r.get("question"),
+            "expected_answer": e,
+            "model_answer": a,
+            "accuracy": 0 if failed else exact_match(a, e, strict),
+            "similarity": 0.0 if failed else round(max(0.0, min(1.0, cosine(va, ve))), 4),
+            "key_fact_recall": None if failed else key_fact_recall(a, r.get("key_facts")),
+            "failed": failed,
+        })
+    return pd.DataFrame(records)
+
+
+def build_summary(df, meta, embedder, strict, source):
+    def agg(g):
+        return {"cases": int(len(g)),
+                "accuracy": round(float(g["accuracy"].mean()), 4),
+                "mean_similarity": round(float(g["similarity"].mean()), 4)}
+    summary = {
+        "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_file": str(source),
+        "model_evaluated": meta.get("model"),
+        "backend": meta.get("backend"),
+        "embedding_model": embedder.name,
+        "exact_match_mode": "strict" if strict else "normalized (case, spaces, end punctuation ignored)",
+        "total_cases": int(len(df)),
+        "failed_cases": int(df["failed"].sum()),
+        "exact_match_count": int(df["accuracy"].sum()),
+        "accuracy": round(float(df["accuracy"].mean()), 4),
+        "mean_similarity": round(float(df["similarity"].mean()), 4),
+        "median_similarity": round(float(df["similarity"].median()), 4),
+        "min_similarity": round(float(df["similarity"].min()), 4),
+        "max_similarity": round(float(df["similarity"].max()), 4),
+        "mean_key_fact_recall": (round(float(df["key_fact_recall"].mean()), 4)
+                                 if df["key_fact_recall"].notna().any() else None),
+        "by_category": {c: agg(g) for c, g in df.groupby("category")},
+    }
+    if meta.get("backend") == "mock" or "tfidf" in embedder.name:
+        summary["warning"] = "Test run only: mock answers and/or stand-in embeddings. Not real results."
+    return summary
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--input", default=str(INPUT_FILE))
+    ap.add_argument("--scores", default=str(SCORES_FILE))
+    ap.add_argument("--summary", default=str(SUMMARY_FILE))
+    ap.add_argument("--embedder", choices=["minilm", "tfidf"], default="minilm")
+    ap.add_argument("--embedding-model", default=EMBEDDING_MODEL)
+    ap.add_argument("--strict", action="store_true", help="exact match with no text clean-up")
+    args = ap.parse_args()
+
+    meta, rows = load_results(args.input)
+    if not rows:
+        sys.exit("No results to score.")
+    if args.embedder == "tfidf":
+        embedder = TfidfEmbedder()
+    else:
+        print(f"Loading embedding model {args.embedding_model} (first run downloads it)...")
+        try:
+            embedder = MiniLMEmbedder(args.embedding_model)
+        except Exception as e:
+            sys.exit(f"Could not load the embedding model: {e}\n"
+                     "Check your internet connection, or run with --embedder tfidf for a pipeline test.")
+
+    df = score(rows, embedder, args.strict)
+    df.to_csv(args.scores, index=False)
+    summary = build_summary(df, meta, embedder, args.strict, args.input)
+    Path(args.summary).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(f"\nScored {len(df)} cases with {embedder.name}")
+    print(f"  accuracy (exact match): {summary['accuracy']:.1%}  ({summary['exact_match_count']}/{len(df)})")
+    print(f"  mean similarity:        {summary['mean_similarity']:.3f}")
+    if summary["failed_cases"]:
+        print(f"  failed cases (scored 0): {summary['failed_cases']}")
+    print(f"Saved {args.scores} and {args.summary}")
+    if "warning" in summary:
+        print("NOTE:", summary["warning"])
+
+
+if __name__ == "__main__":
+    main()
